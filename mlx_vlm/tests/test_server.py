@@ -2484,14 +2484,12 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
             slots,
             *,
             candidate_only=False,
-            encoder_layers=None,
         ):
             captured.update(
                 input_ids=input_ids,
                 seed_canvas=seed_canvas,
                 slots=slots,
                 candidate_only=candidate_only,
-                encoder_layers=encoder_layers,
             )
             return [
                 {
@@ -2513,14 +2511,12 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
         slots,
         *,
         candidate_only=False,
-        encoder_layers=None,
     ):
         return model, worker.diffusion_read(
             input_ids,
             seed_canvas,
             slots,
             candidate_only=candidate_only,
-            encoder_layers=encoder_layers,
         )
 
     monkeypatch.setattr(server._app_module, "_run_cached_diffusion_read", run_read)
@@ -2538,7 +2534,6 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
             "seed_canvas": [5, 6, 7],
             "slots": [{"position": 1, "token_ids": [7, 8]}],
             "candidate_only": True,
-            "encoder_layers": 6,
         },
     )
 
@@ -2548,7 +2543,6 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
         "seed_canvas": [5, 6, 7],
         "slots": [(1, [7, 8])],
         "candidate_only": True,
-        "encoder_layers": 6,
     }
     assert response.json() == {
         "model": "diffusion",
@@ -2566,7 +2560,6 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
             "prompt_tokens": 3,
             "denoising_steps": 1,
             "candidate_only": True,
-            "encoder_layers": 6,
         },
     }
 
@@ -2637,7 +2630,6 @@ def test_diffusion_worker_is_bound_to_the_requested_cache_entry(monkeypatch):
         [4, 5],
         [(1, [7, 8])],
         candidate_only=False,
-        encoder_layers=None,
     )
 
 
@@ -2656,9 +2648,8 @@ def test_diffusion_read_blocks_concurrent_model_switch(monkeypatch):
             slots,
             *,
             candidate_only=False,
-            encoder_layers=None,
         ):
-            del input_ids, seed_canvas, slots, candidate_only, encoder_layers
+            del input_ids, seed_canvas, slots, candidate_only
             read_started.set()
             assert release_read.wait(timeout=2)
             return []

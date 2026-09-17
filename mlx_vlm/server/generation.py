@@ -769,7 +769,6 @@ class QueuedDiffusionReadRequest:
     seed_canvas: List[int]
     slots: List[tuple[int, List[int]]]
     candidate_only: bool = False
-    encoder_layers: Optional[int] = None
 
 
 @dataclass
@@ -1247,7 +1246,6 @@ class ResponseGenerator:
         slots: List[tuple[int, List[int]]],
         *,
         candidate_only: bool = False,
-        encoder_layers: Optional[int] = None,
     ) -> List[dict]:
         """Queue one seeded, read-only diffusion forward on the GPU worker."""
         self.wait_until_ready()
@@ -1276,7 +1274,6 @@ class ResponseGenerator:
                 seed_canvas=seed_canvas,
                 slots=slots,
                 candidate_only=candidate_only,
-                encoder_layers=encoder_layers,
             )
         )
         try:
@@ -1949,7 +1946,6 @@ class ResponseGenerator:
                                 request.seed_canvas,
                                 request.slots,
                                 candidate_only=request.candidate_only,
-                                encoder_layers=request.encoder_layers,
                             )
                             rqueue.put(result)
                         except Exception as error:

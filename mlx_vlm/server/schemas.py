@@ -76,13 +76,6 @@ class DiffusionReadRequest(BaseModel):
         False,
         description="Score only requested token IDs and skip the full vocabulary head.",
     )
-    encoder_layers: Optional[int] = Field(
-        None,
-        ge=0,
-        description=(
-            "Run this many full encoder layers, then build lexical cache entries."
-        ),
-    )
 
 
 class DiffusionReadResult(BaseModel):
@@ -98,7 +91,6 @@ class DiffusionReadUsage(BaseModel):
     prompt_tokens: int
     denoising_steps: int = 1
     candidate_only: bool
-    encoder_layers: Optional[int]
 
 
 class DiffusionReadResponse(BaseModel):

@@ -26,7 +26,6 @@ request = {
     "seed_canvas": seed_canvas,
     "slots": [{"position": 1, "token_ids": [562, 603]}],
     "candidate_only": True,
-    "encoder_layers": 6,
 }
 ```
 
@@ -37,10 +36,6 @@ the active canvas.
 Set `candidate_only` when the requested IDs form a closed answer set. It skips
 the full vocabulary output head. Its scores and diagnostics cover only the
 requested IDs.
-
-Set `encoder_layers` to run only the first part of the full encoder. Later
-layers still build attention cache entries from the last full hidden state.
-This is an approximate fast path. Check its accuracy on the target task.
 
 The response keeps token IDs and log probabilities in request order:
 
@@ -60,13 +55,12 @@ The response keeps token IDs and log probabilities in request order:
   "usage": {
     "prompt_tokens": 3,
     "denoising_steps": 1,
-    "candidate_only": true,
-    "encoder_layers": 6
+    "candidate_only": true
   }
 }
 ```
 
-The usage block confirms the scoring and encoder settings used by the server.
+The usage block confirms the scoring mode used by the server.
 
 Without `candidate_only`, `token_id`, `token_logprob`, and `entropy` cover the
 full vocabulary. `logprobs` holds the score for each requested token. With

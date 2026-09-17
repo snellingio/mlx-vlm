@@ -1047,7 +1047,6 @@ def _run_cached_diffusion_read(
     slots,
     *,
     candidate_only=False,
-    encoder_layers=None,
 ):
     """Load, bind, and keep the exact worker alive for one structured read."""
     with _model_cache_guard():
@@ -1066,7 +1065,6 @@ def _run_cached_diffusion_read(
             seed_canvas,
             slots,
             candidate_only=candidate_only,
-            encoder_layers=encoder_layers,
         )
         return served_model, reads
 
@@ -1089,7 +1087,6 @@ async def diffusion_reads_endpoint(read_request: DiffusionReadRequest):
             read_request.seed_canvas,
             slots,
             candidate_only=read_request.candidate_only,
-            encoder_layers=read_request.encoder_layers,
         )
         return DiffusionReadResponse(
             model=served_model,
@@ -1097,7 +1094,6 @@ async def diffusion_reads_endpoint(read_request: DiffusionReadRequest):
             usage={
                 "prompt_tokens": len(read_request.input_ids),
                 "candidate_only": read_request.candidate_only,
-                "encoder_layers": read_request.encoder_layers,
             },
         )
     except HTTPException:

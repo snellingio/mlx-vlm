@@ -2171,147 +2171,8 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
             np.array(larger_fused),
         )
 
-    def test_fused_sliding_kv_matches_separate_projection(self):
-        if mx.default_device() != mx.gpu:
-            self.skipTest("custom Metal kernels require a GPU")
-
-        import mlx.nn as nn
-
-        from mlx_vlm.generate.diffusion import _structured_sliding_kv
-        from mlx_vlm.models.gemma4.language import RMSNormNoScale
-
-        mx.random.seed(0)
-        attention = SimpleNamespace(
-            n_kv_heads=8,
-            head_dim=256,
-            k_proj=nn.QuantizedLinear(64, 2048, bias=False, group_size=64, bits=8),
-            v_proj=nn.QuantizedLinear(64, 2048, bias=False, group_size=64, bits=8),
-            k_norm=nn.RMSNorm(256, eps=1e-6),
-            v_norm=RMSNormNoScale(256, eps=1e-6),
-            rope=nn.RoPE(256, traditional=False, base=10000.0),
-        )
-        for projection in (attention.k_proj, attention.v_proj):
-            projection.scales = projection.scales.astype(mx.bfloat16)
-            projection.biases = projection.biases.astype(mx.bfloat16)
-        attention.k_norm.weight = attention.k_norm.weight.astype(mx.bfloat16)
-        hidden = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
-        batch, length, _ = hidden.shape
-        for offset in (0, 9):
-            with self.subTest(offset=offset):
-                keys = attention.k_proj(hidden).reshape(batch, length, 8, 256)
-                values = attention.v_proj(hidden).reshape(batch, length, 8, 256)
-                keys = attention.rope(
-                    attention.k_norm(keys).transpose(0, 2, 1, 3),
-                    offset=offset,
-                )
-                values = attention.v_norm(values).transpose(0, 2, 1, 3)
-                fused_keys, fused_values = _structured_sliding_kv(
-                    attention,
-                    hidden,
-                    offset=offset,
-                )
-                mx.eval(keys, values, fused_keys, fused_values)
-                np.testing.assert_allclose(
-                    np.array(keys.astype(mx.float32)),
-                    np.array(fused_keys.astype(mx.float32)),
-                    rtol=0.02,
-                    atol=0.02,
-                )
-                np.testing.assert_allclose(
-                    np.array(values.astype(mx.float32)),
-                    np.array(fused_values.astype(mx.float32)),
-                    rtol=0.02,
-                    atol=0.13,
-                )
-
-    def test_structured_prefill_keeps_only_sliding_decoder_window(self):
-        from mlx_vlm.generate.diffusion import _structured_diffusion_prefill_cache
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        model = Model(ModelConfig.from_dict(tiny_config_dict()))
-        input_ids = mx.arange(10, dtype=mx.int32)[None]
-        window_prefix = model.config.text_config.sliding_window - 1
-
-        cache_only = _structured_diffusion_prefill_cache(
-            model,
-            input_ids,
-            encoder_layers=0,
-        )
-        fully_computed = _structured_diffusion_prefill_cache(
-            model,
-            input_ids,
-            encoder_layers=2,
-        )
-        full_reference = model.diffusion_prefill_cache(
-            input_ids,
-            cache=model.make_cache(),
-        )
-        mx.eval(
-            [entry.state for entry in cache_only],
-            [entry.state for entry in fully_computed],
-            [entry.state for entry in full_reference],
-        )
-
-        for optimized in (cache_only, fully_computed):
-            self.assertEqual(optimized[0].state[0].shape[2], window_prefix)
-            self.assertEqual(optimized[0].offset, input_ids.shape[1])
-            self.assertEqual(optimized[1].state[0].shape[2], input_ids.shape[1])
-            self.assertEqual(optimized[1].offset, input_ids.shape[1])
-
-        hidden = model.model.encoder._embed_inputs(input_ids)
-        attention = model.model.decoder.layers[0].self_attn
-        normalized = model.model.decoder.layers[0].input_layernorm(hidden)
-        batch, length, _ = normalized.shape
-        expected_keys = attention.k_proj(normalized).reshape(
-            batch,
-            length,
-            attention.n_kv_heads,
-            attention.head_dim,
-        )
-        expected_values = attention.v_proj(normalized).reshape(
-            batch,
-            length,
-            attention.n_kv_heads,
-            attention.head_dim,
-        )
-        expected_keys = attention.rope(
-            attention.k_norm(expected_keys).transpose(0, 2, 1, 3),
-            offset=0,
-        )
-        expected_values = attention.v_norm(expected_values).transpose(0, 2, 1, 3)
-        mx.eval(expected_keys, expected_values)
-        for optimized_state, reference_state in zip(
-            cache_only[0].state,
-            (expected_keys, expected_values),
-        ):
-            np.testing.assert_array_equal(
-                np.array(optimized_state),
-                np.array(reference_state[:, :, -window_prefix:, :]),
-            )
-
-        for optimized_state, reference_state in zip(
-            fully_computed[0].state,
-            full_reference[0].state,
-        ):
-            np.testing.assert_array_equal(
-                np.array(optimized_state),
-                np.array(reference_state[:, :, -window_prefix:, :]),
-            )
-        for optimized_state, reference_state in zip(
-            fully_computed[1].state,
-            full_reference[1].state,
-        ):
-            np.testing.assert_array_equal(
-                np.array(optimized_state),
-                np.array(reference_state),
-            )
-
     def test_compiled_one_token_decoder_matches_eager_decoder(self):
-        from mlx_vlm.generate.diffusion import (
-            _make_structured_one_token_decoder,
-            _structured_diffusion_prefill_cache,
-        )
+        from mlx_vlm.generate.diffusion import _make_structured_one_token_decoder
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
         mx.random.seed(0)
@@ -2320,10 +2181,9 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
         for length in (2, 10):
             with self.subTest(length=length):
                 input_ids = mx.arange(length, dtype=mx.int32)[None]
-                cache = _structured_diffusion_prefill_cache(
-                    model,
+                cache = model.diffusion_prefill_cache(
                     input_ids,
-                    encoder_layers=2,
+                    cache=model.make_cache(),
                 )
                 canvas = mx.array([[4]], dtype=mx.int32)
                 masks = model.diffusion_decoder_masks(canvas, cache, None)
@@ -2408,15 +2268,6 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
             [4],
             [(0, [7, 8])],
         )
-        reduced_result = structured_diffusion_read(
-            model,
-            mx.array([[2, 3]], dtype=mx.int32),
-            [4],
-            [(0, [7, 8])],
-            candidate_only=True,
-            encoder_layers=1,
-        )
-
         self.assertEqual(result[0]["position"], 0)
         self.assertIn(result[0]["token_id"], [7, 8])
         self.assertEqual(result[0]["token_ids"], [7, 8])
@@ -2429,17 +2280,6 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
             rtol=1e-5,
             atol=1e-6,
         )
-        self.assertIn(reduced_result[0]["token_id"], [7, 8])
-
-        with self.assertRaisesRegex(ValueError, "encoder_layers"):
-            structured_diffusion_read(
-                model,
-                mx.array([[2, 3]], dtype=mx.int32),
-                [4],
-                [(0, [7, 8])],
-                candidate_only=True,
-                encoder_layers=999,
-            )
 
     def test_stream_generate_emits_block_boundaries(self):
         from mlx_vlm.generate import stream_generate
