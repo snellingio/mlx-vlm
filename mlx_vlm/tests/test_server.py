@@ -2695,7 +2695,7 @@ def test_diffusion_read_blocks_concurrent_model_switch(monkeypatch):
     assert other_load_started.is_set()
 
 
-def test_diffusion_read_keeps_http_event_loop_responsive(monkeypatch):
+def test_diffusion_read_keeps_http_routes_responsive(client, monkeypatch):
     read_started = Event()
     release_read = Event()
 
@@ -2738,21 +2738,66 @@ def test_diffusion_read_keeps_http_event_loop_responsive(monkeypatch):
     read_thread.start()
     assert read_started.wait(timeout=2)
 
-    async def probe_http_loop():
-        with pytest.raises(server._app_module.HTTPException) as error:
-            server._app_module.get_cached_model("other", None)
-        health = await server._app_module.health_check(MagicMock())
-        return error.value.status_code, health
+    def request_in_thread(method, path, result, done, **kwargs):
+        result.append(getattr(client, method)(path, **kwargs))
+        done.set()
 
+    request_threads = []
     try:
-        status_code, health = asyncio.run(
-            asyncio.wait_for(probe_http_loop(), timeout=0.5)
-        )
-        assert status_code == 503
-        assert health["status"] == "healthy"
+        requests = [
+            (
+                "post",
+                "/v1/chat/completions",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 1,
+                    }
+                },
+            ),
+            (
+                "post",
+                "/v1/messages",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 1,
+                    }
+                },
+            ),
+            (
+                "post",
+                "/v1/messages/count_tokens",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    }
+                },
+            ),
+            ("get", "/health", {}),
+        ]
+        for method, path, kwargs in requests:
+            result = []
+            done = Event()
+            request_thread = Thread(
+                target=request_in_thread,
+                args=(method, path, result, done),
+                kwargs=kwargs,
+            )
+            request_threads.append(request_thread)
+            request_thread.start()
+            assert done.wait(timeout=0.5), f"{path} blocked on the model cache"
+            request_thread.join(timeout=0.5)
+            expected_status = 200 if path == "/health" else 503
+            assert result[0].status_code == expected_status
     finally:
         release_read.set()
         read_thread.join(timeout=2)
+        for request_thread in request_threads:
+            request_thread.join(timeout=2)
 
     assert not read_thread.is_alive()
 
