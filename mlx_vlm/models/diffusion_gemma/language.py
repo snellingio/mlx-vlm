@@ -9,19 +9,39 @@ from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
+    supports_fast_sdpa_window_size,
 )
 from ..cache import KVCache, RotatingKVCache, StaticPrefixKVCache
 from ..gemma4.gemma4 import MultimodalEmbedder, masked_scatter
 from ..gemma4.language import RMSNormNoScale
 from ..gemma4.vision import VisionModel
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
+from ..switch_layers import (
+    QuantizedSwitchLinear,
+    SwitchLinear,
+    _apply_geglu_projection,
+    _gather_sort_with_order,
+    _supports_quantized_moe_down,
+)
 from .config import ModelConfig, TextConfig
+
+FUSED_MOE_DOWN_MIN_ROUTES = 384
 
 
 @partial(mx.compile, shapeless=True)
 def geglu(gate, x):
     return nn.gelu_approx(gate) * x
+
+
+@partial(mx.compile, shapeless=True)
+def _weighted_expert_reduce(y, weights):
+    return (y.squeeze(-2) * weights[..., None]).sum(axis=-2)
+
+
+@mx.compile
+def _unsort_weighted_expert_reduce(y, inv_order, weights):
+    y = y[inv_order].reshape(*weights.shape, 1, y.shape[-1])
+    return (y.squeeze(-2) * weights[..., None]).sum(axis=-2)
 
 
 def make_compiled_softcap(softcap: float):
@@ -118,22 +138,59 @@ class Experts(nn.Module):
         x = mx.expand_dims(x, (-2, -3))
         do_sort = top_k_indices.size >= 64
         indices = top_k_indices
+        order = None
         inv_order = None
         if do_sort:
-            x, indices, inv_order = _gather_sort(x, top_k_indices)
+            x, indices, order, inv_order = _gather_sort_with_order(x, top_k_indices)
         if self.training:
             indices = mx.stop_gradient(indices)
 
-        gate_up = self.gate_up_proj(x, indices, sorted_indices=do_sort)
-        gate = gate_up[..., : self.hidden_dims]
-        up = gate_up[..., self.hidden_dims :]
-        y = self.down_proj(geglu(gate, up), indices, sorted_indices=do_sort)
+        use_fused_gate = (
+            not self.training
+            and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
+            and do_sort
+        )
+        hidden = self.gate_up_proj(
+            x,
+            indices,
+            sorted_indices=do_sort,
+            **({"fused_geglu": True} if use_fused_gate else {}),
+        )
+        if not use_fused_gate:
+            hidden = _apply_geglu_projection(hidden)
+        down = self.down_proj
+        use_fused_down = (
+            not self.training
+            and do_sort
+            and top_k_indices.size >= FUSED_MOE_DOWN_MIN_ROUTES
+            and _supports_quantized_moe_down()
+            and getattr(down, "bits", None) == 4
+            and getattr(down, "group_size", None) == 64
+            and getattr(down, "mode", None) == "affine"
+            and getattr(down, "biases", None) is not None
+            and "bias" not in down
+        )
+        if use_fused_down:
+            flat_weights = top_k_weights.reshape(-1)
+            sorted_weights = flat_weights[order]
+            token_indices = (order // top_k_indices.shape[-1]).astype(mx.uint32)
+            return mx.fast.quantized_moe_down(
+                hidden,
+                down.weight,
+                down.scales,
+                down.biases,
+                indices,
+                token_indices,
+                sorted_weights,
+                output_rows=top_k_indices.size // top_k_indices.shape[-1],
+                group_size=down.group_size,
+                bits=down.bits,
+            ).astype(hidden.dtype)
+        y = self.down_proj(hidden, indices, sorted_indices=do_sort)
 
         if do_sort:
-            y = _scatter_unsort(y, inv_order, top_k_indices.shape)
-
-        y = y.squeeze(-2)
-        return (y * top_k_weights[..., None]).sum(axis=-2)
+            return _unsort_weighted_expert_reduce(y, inv_order, top_k_weights)
+        return _weighted_expert_reduce(y, top_k_weights)
 
 
 class Attention(nn.Module):
@@ -251,7 +308,20 @@ class Attention(nn.Module):
             attn_cache = cache
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=attn_cache, scale=self.scale, mask=mask
+            queries,
+            keys,
+            values,
+            cache=attn_cache,
+            scale=self.scale,
+            mask=mask,
+            window_size=(
+                self.config.sliding_window
+                if self.is_sliding
+                and not decoder
+                and isinstance(mask, str)
+                and mask == "causal"
+                else None
+            ),
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -704,6 +774,8 @@ class EncoderModel(nn.Module):
             overlay = None
 
         if attention_mask is None and overlay is None:
+            if supports_fast_sdpa_window_size():
+                return ["causal"] * len(self.decoder.layers)
             return [
                 create_attention_mask(
                     h,

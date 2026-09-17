@@ -9,12 +9,46 @@ from .activations import swiglu
 from .linear import DECODE_BLOCK_SIZE
 
 
-def _gather_sort(x, indices):
+def _supports_fused_gather_qmm_geglu() -> bool:
+    metal = getattr(mx, "metal", None)
+    signatures = getattr(mx.gather_qmm, "__nb_signature__", ())
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+        and any("fused_geglu" in signature[0] for signature in signatures)
+    )
+
+
+def _supports_quantized_moe_down() -> bool:
+    metal = getattr(mx, "metal", None)
+    signatures = getattr(
+        getattr(mx.fast, "quantized_moe_down", None), "__nb_signature__", ()
+    )
+    return (
+        mx.default_device() == mx.gpu
+        and metal is not None
+        and metal.is_available()
+        and any("quantized_moe_down" in signature[0] for signature in signatures)
+    )
+
+
+def _apply_geglu_projection(x):
+    gate, up = mx.split(x, 2, axis=-1)
+    return nn.gelu_approx(gate) * up
+
+
+def _gather_sort_with_order(x, indices):
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    return x.flatten(0, -3)[order // M], indices[order], order, inv_order
+
+
+def _gather_sort(x, indices):
+    x, indices, _, inv_order = _gather_sort_with_order(x, indices)
+    return x, indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -71,7 +105,18 @@ class QuantizedSwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
-    def __call__(self, x, indices, sorted_indices=False):
+    def __call__(self, x, indices, sorted_indices=False, fused_geglu=False):
+        use_fused_geglu = (
+            fused_geglu
+            and _supports_fused_gather_qmm_geglu()
+            and sorted_indices
+            and self.bits == 4
+            and self.group_size == 64
+            and self.mode == "affine"
+            and x.shape[-2] == 1
+            and x.shape[-1] % 32 == 0
+            and self.weight.shape[-2] % 64 == 0
+        )
         x = mx.gather_qmm(
             x,
             self["weight"],
@@ -83,8 +128,13 @@ class QuantizedSwitchLinear(nn.Module):
             bits=self.bits,
             mode=self.mode,
             sorted_indices=sorted_indices,
+            **({"fused_geglu": True} if use_fused_geglu else {}),
         )
+        if fused_geglu and not use_fused_geglu:
+            x = _apply_geglu_projection(x)
         if "bias" in self:
+            if fused_geglu:
+                raise ValueError("Fused GeGLU does not support projection bias.")
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
 
@@ -116,7 +166,7 @@ class SwitchLinear(nn.Module):
     def num_experts(self):
         return self.weight.shape[0]
 
-    def __call__(self, x, indices, sorted_indices=False):
+    def __call__(self, x, indices, sorted_indices=False, fused_geglu=False):
         x = mx.gather_mm(
             x,
             self["weight"].swapaxes(-1, -2),
@@ -124,7 +174,11 @@ class SwitchLinear(nn.Module):
             sorted_indices=sorted_indices,
         )
         if "bias" in self:
+            if fused_geglu:
+                raise ValueError("Fused GeGLU does not support projection bias.")
             x = x + mx.expand_dims(self["bias"][indices], -2)
+        if fused_geglu:
+            x = _apply_geglu_projection(x)
         return x
 
     def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):

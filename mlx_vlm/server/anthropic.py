@@ -1068,6 +1068,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 500, f"Generation failed: {e}", "api_error"
             )
 
+    except HTTPException as e:
+        return _anthropic_error_response(e.status_code, str(e.detail))
     except Exception as e:
         traceback.print_exc()
         mx.clear_cache()
@@ -1116,5 +1118,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 image_token_index=image_token_index,
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
+    except HTTPException as e:
+        return _anthropic_error_response(e.status_code, str(e.detail))
     except Exception as e:
         return _anthropic_error_response(400, str(e))

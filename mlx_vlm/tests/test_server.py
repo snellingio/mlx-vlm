@@ -2473,6 +2473,384 @@ def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
     assert calls == {"clear_cache": 0, "collect": 0}
 
 
+def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeypatch):
+    captured = {}
+
+    class FakeResponseGenerator:
+        def diffusion_read(
+            self,
+            input_ids,
+            seed_canvas,
+            slots,
+            *,
+            candidate_only=False,
+        ):
+            captured.update(
+                input_ids=input_ids,
+                seed_canvas=seed_canvas,
+                slots=slots,
+                candidate_only=candidate_only,
+            )
+            return [
+                {
+                    "position": 1,
+                    "token_id": 7,
+                    "token_logprob": -0.2,
+                    "entropy": 0.6,
+                    "token_ids": [7, 8],
+                    "logprobs": [-0.25, -2.25],
+                }
+            ]
+
+    worker = FakeResponseGenerator()
+
+    def run_read(
+        model,
+        input_ids,
+        seed_canvas,
+        slots,
+        *,
+        candidate_only=False,
+    ):
+        return model, worker.diffusion_read(
+            input_ids,
+            seed_canvas,
+            slots,
+            candidate_only=candidate_only,
+        )
+
+    monkeypatch.setattr(server._app_module, "_run_cached_diffusion_read", run_read)
+    monkeypatch.setattr(
+        server._app_module.runtime,
+        "response_generator",
+        MagicMock(side_effect=AssertionError("global generator must not be used")),
+    )
+
+    response = client.post(
+        "/v1/diffusion/reads",
+        json={
+            "model": "diffusion",
+            "input_ids": [2, 3, 4],
+            "seed_canvas": [5, 6, 7],
+            "slots": [{"position": 1, "token_ids": [7, 8]}],
+            "candidate_only": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "input_ids": [2, 3, 4],
+        "seed_canvas": [5, 6, 7],
+        "slots": [(1, [7, 8])],
+        "candidate_only": True,
+    }
+    assert response.json() == {
+        "model": "diffusion",
+        "reads": [
+            {
+                "position": 1,
+                "token_id": 7,
+                "token_logprob": -0.2,
+                "entropy": 0.6,
+                "token_ids": [7, 8],
+                "logprobs": [-0.25, -2.25],
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 3,
+            "denoising_steps": 1,
+            "candidate_only": True,
+        },
+    }
+
+
+def test_diffusion_worker_batches_equal_shape_reads(monkeypatch):
+    generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    generator.model = object()
+    first_queue = Queue()
+    second_queue = Queue()
+    requests = [
+        server_generation.QueuedDiffusionReadRequest(
+            rqueue=first_queue,
+            input_ids=[1, 2],
+            seed_canvas=[3, 4],
+            slots=[(0, [5, 6])],
+            candidate_only=True,
+        ),
+        server_generation.QueuedDiffusionReadRequest(
+            rqueue=second_queue,
+            input_ids=[7, 8],
+            seed_canvas=[9, 10],
+            slots=[(1, [11, 12, 13])],
+            candidate_only=True,
+        ),
+    ]
+    captured = {}
+
+    def fake_batch(model, input_ids, canvases, slots_batch, *, candidate_only):
+        captured.update(
+            model=model,
+            input_ids=np.array(input_ids),
+            canvases=canvases,
+            slots_batch=slots_batch,
+            candidate_only=candidate_only,
+        )
+        return [[{"position": 0}], [{"position": 1}]]
+
+    monkeypatch.setattr(
+        server_generation,
+        "structured_diffusion_read_batch",
+        fake_batch,
+    )
+
+    generator._run_diffusion_read_batch(requests)
+
+    np.testing.assert_array_equal(captured["input_ids"], [[1, 2], [7, 8]])
+    assert captured["model"] is generator.model
+    assert captured["canvases"] == [[3, 4], [9, 10]]
+    assert captured["slots_batch"] == [[(0, [5, 6])], [(1, [11, 12, 13])]]
+    assert captured["candidate_only"] is True
+    assert first_queue.get_nowait() == [{"position": 0}]
+    assert second_queue.get_nowait() == [{"position": 1}]
+
+
+def test_diffusion_read_batch_settings(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_DIFFUSION_READ_BATCH_COALESCE_MS", "3.5")
+    monkeypatch.setenv("MLX_VLM_DIFFUSION_READ_MAX_BATCH_SIZE", "4")
+
+    assert server_generation.get_diffusion_read_batch_coalesce_s() == 0.0035
+    assert server_generation.get_diffusion_read_max_batch_size() == 4
+
+
+def test_diffusion_read_rejects_native_context_overflow_before_queue(monkeypatch):
+    generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    generator.wait_until_ready = lambda: None
+    generator.model = object()
+    generator.config = SimpleNamespace(
+        text_config=SimpleNamespace(max_position_embeddings=4)
+    )
+    generator.requests = MagicMock()
+    monkeypatch.setattr(server_generation, "is_diffusion_model", lambda model: True)
+
+    with pytest.raises(server.PromptTooLongError, match="model limit is 4"):
+        generator.diffusion_read([1, 2, 3], [4, 5], [(0, [7])])
+
+    generator.requests.put.assert_not_called()
+
+
+def test_diffusion_reads_endpoint_limits_total_requested_tokens(client, monkeypatch):
+    run_read = MagicMock()
+    monkeypatch.setattr(server._app_module, "MAX_DIFFUSION_READ_TOKEN_IDS", 1)
+    monkeypatch.setattr(
+        server._app_module,
+        "_run_cached_diffusion_read",
+        run_read,
+    )
+
+    response = client.post(
+        "/v1/diffusion/reads",
+        json={
+            "model": "diffusion",
+            "input_ids": [2, 3, 4],
+            "seed_canvas": [5, 6, 7],
+            "slots": [{"position": 1, "token_ids": [7, 8]}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert "at most 1 token IDs" in response.json()["detail"]
+    run_read.assert_not_called()
+
+
+def test_diffusion_worker_is_bound_to_the_requested_cache_entry(monkeypatch):
+    generator = SimpleNamespace(
+        model_path="diffusion",
+        diffusion_read=MagicMock(return_value=[{"position": 1}]),
+    )
+    registry = MagicMock()
+    registry.for_kind.return_value = {
+        "model_path": "diffusion",
+        "response_generator": generator,
+    }
+    load = MagicMock()
+    monkeypatch.setattr(server._app_module, "_get_cached_model_unlocked", load)
+    monkeypatch.setattr(server._app_module, "_model_cache_registry", lambda: registry)
+
+    result = server._app_module._run_cached_diffusion_read(
+        "diffusion", [2, 3], [4, 5], [(1, [7, 8])]
+    )
+
+    assert result == ("diffusion", [{"position": 1}])
+    load.assert_called_once_with("diffusion", None)
+    registry.for_kind.assert_called_once_with("text_generation")
+    generator.diffusion_read.assert_called_once_with(
+        [2, 3],
+        [4, 5],
+        [(1, [7, 8])],
+        candidate_only=False,
+    )
+
+
+def test_diffusion_read_blocks_concurrent_model_switch(monkeypatch):
+    read_started = Event()
+    release_read = Event()
+    other_load_started = Event()
+
+    class BlockingGenerator:
+        model_path = "diffusion"
+
+        def diffusion_read(
+            self,
+            input_ids,
+            seed_canvas,
+            slots,
+            *,
+            candidate_only=False,
+        ):
+            del input_ids, seed_canvas, slots, candidate_only
+            read_started.set()
+            assert release_read.wait(timeout=2)
+            return []
+
+    registry = MagicMock()
+    registry.for_kind.return_value = {
+        "model_path": "diffusion",
+        "response_generator": BlockingGenerator(),
+    }
+
+    def fake_load(model_path, adapter_path, *, model_kind="auto"):
+        del adapter_path, model_kind
+        if model_path == "other":
+            other_load_started.set()
+
+    monkeypatch.setattr(server._app_module, "_get_cached_model_unlocked", fake_load)
+    monkeypatch.setattr(server._app_module, "_model_cache_registry", lambda: registry)
+
+    read_thread = Thread(
+        target=server._app_module._run_cached_diffusion_read,
+        args=("diffusion", [2], [3], [(0, [4])]),
+    )
+    load_thread = Thread(
+        target=server._app_module.get_cached_model, args=("other", None)
+    )
+    read_thread.start()
+    assert read_started.wait(timeout=2)
+    load_thread.start()
+
+    assert not other_load_started.wait(timeout=0.1)
+    release_read.set()
+    read_thread.join(timeout=2)
+    load_thread.join(timeout=2)
+    assert other_load_started.is_set()
+
+
+def test_diffusion_read_keeps_http_routes_responsive(client, monkeypatch):
+    read_started = Event()
+    release_read = Event()
+
+    class BlockingGenerator:
+        model_path = "diffusion"
+
+        def diffusion_read(self, *args, **kwargs):
+            del args, kwargs
+            read_started.set()
+            assert release_read.wait(timeout=2)
+            return []
+
+    registry = MagicMock()
+    registry.for_kind.return_value = {
+        "model_path": "diffusion",
+        "response_generator": BlockingGenerator(),
+    }
+    monkeypatch.setattr(server._app_module, "_get_cached_model_unlocked", MagicMock())
+    monkeypatch.setattr(server._app_module, "_model_cache_registry", lambda: registry)
+    monkeypatch.setattr(
+        server._app_module,
+        "_server_runtime_snapshot",
+        lambda: {
+            "loaded_model": "diffusion",
+            "loaded_adapter": None,
+            "loaded_models": ["diffusion"],
+            "loaded_context_size": None,
+            "configured_context_limit": None,
+            "effective_context_limit": None,
+            "loaded_tool_parser": None,
+            "continuous_batching_enabled": True,
+            "apc": {"enabled": False},
+        },
+    )
+
+    read_thread = Thread(
+        target=server._app_module._run_cached_diffusion_read,
+        args=("diffusion", [2], [3], [(0, [4])]),
+    )
+    read_thread.start()
+    assert read_started.wait(timeout=2)
+
+    def request_in_thread(method, path, result, done, **kwargs):
+        result.append(getattr(client, method)(path, **kwargs))
+        done.set()
+
+    request_threads = []
+    try:
+        requests = [
+            (
+                "post",
+                "/v1/chat/completions",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 1,
+                    }
+                },
+            ),
+            (
+                "post",
+                "/v1/messages",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 1,
+                    }
+                },
+            ),
+            (
+                "post",
+                "/v1/messages/count_tokens",
+                {
+                    "json": {
+                        "model": "other",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    }
+                },
+            ),
+            ("get", "/health", {}),
+        ]
+        for method, path, kwargs in requests:
+            result = []
+            done = Event()
+            request_thread = Thread(
+                target=request_in_thread,
+                args=(method, path, result, done),
+                kwargs=kwargs,
+            )
+            request_threads.append(request_thread)
+            request_thread.start()
+            assert done.wait(timeout=0.5), f"{path} blocked on the model cache"
+            request_thread.join(timeout=0.5)
+            expected_status = 200 if path == "/health" else 503
+            assert result[0].status_code == expected_status
+    finally:
+        release_read.set()
+        read_thread.join(timeout=2)
+        for request_thread in request_threads:
+            request_thread.join(timeout=2)
+
+    assert not read_thread.is_alive()
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
@@ -5117,6 +5495,26 @@ class TestResponseGenerator:
 
         assert pending == [first, second]
         assert should_stop is False
+
+    def test_collect_pending_requests_leaves_items_past_capacity_queued(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        first = object()
+        second = object()
+        third = object()
+        for item in (first, second, third):
+            gen.requests.put(item)
+
+        pending, should_stop = gen._collect_pending_requests(
+            active=False,
+            capacity=1,
+        )
+
+        assert pending == [first]
+        assert should_stop is False
+        assert gen.requests.get_nowait() is second
+        assert gen.requests.get_nowait() is third
 
     def test_step_streams_spm_subword_tokens_immediately(self):
         class SentencePieceTokenizer:

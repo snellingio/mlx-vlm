@@ -32,6 +32,16 @@ DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
 
 
+class _StructuredDecoderCache:
+    def __init__(self, state, offset):
+        self.keys, self.values = state
+        self.offset = offset
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
     terminal_width = shutil.get_terminal_size((120, 20)).columns
     requested_width = requested_width or DEFAULT_DIFFUSION_UNMASKING_WIDTH
@@ -500,6 +510,339 @@ def _make_diffusion_decoder_logits_fns(
     if compile_graph:
         return mx.compile(without_self_conditioning), mx.compile(with_self_conditioning)
     return without_self_conditioning, with_self_conditioning
+
+
+def structured_diffusion_read(
+    model: nn.Module,
+    input_ids: mx.array,
+    seed_canvas: List[int],
+    slots: List[tuple[int, List[int]]],
+    *,
+    candidate_only: bool = False,
+) -> List[dict]:
+    """Run one read-only denoising step over a caller-provided canvas.
+
+    Each slot names one canvas position and the exact vocabulary token IDs to
+    read there. Candidate-only reads normalize over those requested IDs. Other
+    reads use the full temperature-1 vocabulary distribution. The canvas is
+    never committed to the KV cache.
+    """
+    if input_ids.ndim == 1:
+        input_ids = input_ids[None]
+    return structured_diffusion_read_batch(
+        model,
+        input_ids,
+        [seed_canvas],
+        [slots],
+        candidate_only=candidate_only,
+    )[0]
+
+
+def structured_diffusion_read_batch(
+    model: nn.Module,
+    input_ids: mx.array,
+    seed_canvases: List[List[int]],
+    slots_batch: List[List[tuple[int, List[int]]]],
+    *,
+    candidate_only: bool = False,
+) -> List[List[dict]]:
+    """Run equal-shape structured reads in one scheduled graph batch."""
+    if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+        raise ValueError("input_ids must contain non-empty prompts")
+    batch_size = input_ids.shape[0]
+    if len(seed_canvases) != batch_size or len(slots_batch) != batch_size:
+        raise ValueError(
+            "input_ids, seed_canvases, and slots_batch must have equal size"
+        )
+    if len({len(canvas) for canvas in seed_canvases}) != 1:
+        raise ValueError("batched seed canvases must have equal length")
+    if len({len(slots) for slots in slots_batch}) != 1:
+        raise ValueError("batched slot lists must have equal length")
+
+    max_canvas_length = int(model.config.canvas_length)
+    vocab_size = int(model.config.text_config.vocab_size)
+    if bool(mx.any(input_ids < 0).item()) or bool(
+        mx.any(input_ids >= vocab_size).item()
+    ):
+        raise ValueError("input_ids contains a token id outside the model vocabulary")
+    positions_batch = []
+    for seed_canvas, slots in zip(seed_canvases, slots_batch):
+        if not seed_canvas or len(seed_canvas) > max_canvas_length:
+            raise ValueError(
+                "seed_canvas must hold between 1 and "
+                f"{max_canvas_length} ids, got {len(seed_canvas)}"
+            )
+        if any(token_id < 0 or token_id >= vocab_size for token_id in seed_canvas):
+            raise ValueError(
+                "seed_canvas contains a token id outside the model vocabulary"
+            )
+        if not slots:
+            raise ValueError("at least one read slot is required")
+
+        positions = []
+        for position, token_ids in slots:
+            if position < 0 or position >= len(seed_canvas):
+                raise ValueError(f"read slot position {position} is outside the canvas")
+            if position in positions:
+                raise ValueError(f"read slot position {position} is duplicated")
+            if not token_ids:
+                raise ValueError(f"read slot position {position} has no token ids")
+            if len(token_ids) != len(set(token_ids)):
+                raise ValueError(
+                    f"read slot position {position} has duplicate token ids"
+                )
+            if any(token_id < 0 or token_id >= vocab_size for token_id in token_ids):
+                raise ValueError(
+                    f"read slot position {position} contains a token id outside "
+                    "the model vocabulary"
+                )
+            positions.append(position)
+        positions_batch.append(positions)
+
+    if batch_size > 1:
+        if not candidate_only:
+            return [
+                structured_diffusion_read(
+                    model,
+                    input_ids[row],
+                    seed_canvases[row],
+                    slots_batch[row],
+                )
+                for row in range(batch_size)
+            ]
+        return _structured_candidate_graph_batch(
+            model,
+            input_ids,
+            seed_canvases,
+            slots_batch,
+            positions_batch,
+        )
+
+    cache = model.diffusion_prefill_cache(input_ids, cache=model.make_cache())
+    mx.eval([entry.state for entry in cache])
+
+    canvas = mx.array(seed_canvases, dtype=input_ids.dtype)
+    mask_mapping = model.diffusion_decoder_masks(canvas, cache)
+    batch_indices = mx.arange(batch_size)[:, None]
+    positions_array = mx.array(positions_batch)
+    if candidate_only:
+        hidden_states = _structured_decode(
+            model,
+            canvas,
+            cache,
+            mask_mapping,
+        )[batch_indices, positions_array]
+        max_candidates = max(
+            len(token_ids) for slots in slots_batch for _, token_ids in slots
+        )
+        padded_ids = []
+        candidate_masks = []
+        for slots in slots_batch:
+            row_ids = []
+            row_masks = []
+            for _, token_ids in slots:
+                padding = max_candidates - len(token_ids)
+                row_ids.append(token_ids + [token_ids[0]] * padding)
+                row_masks.append([True] * len(token_ids) + [False] * padding)
+            padded_ids.append(row_ids)
+            candidate_masks.append(row_masks)
+        token_array = mx.array(padded_ids)
+        candidate_mask = mx.array(candidate_masks)
+        weights = model.model.decoder.embed_tokens(token_array)
+        logits = mx.matmul(
+            hidden_states.astype(mx.float32)[..., None, :],
+            mx.swapaxes(weights.astype(mx.float32), -1, -2),
+        ).squeeze(-2)
+        logits = model._softcap(logits)
+        logits = mx.where(candidate_mask, logits, -mx.inf)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        argmax_indices = mx.argmax(logits, axis=-1)
+        token_logprobs = mx.take_along_axis(
+            logprobs, argmax_indices[..., None], axis=-1
+        ).squeeze(-1)
+        entropy_terms = mx.where(candidate_mask, mx.exp(logprobs) * logprobs, 0.0)
+        entropies = -mx.sum(entropy_terms, axis=-1)
+        mx.eval(logprobs, argmax_indices, token_logprobs, entropies)
+
+        results = []
+        for batch_index, slots in enumerate(slots_batch):
+            reads = []
+            for slot_index, (position, token_ids) in enumerate(slots):
+                argmax_index = int(argmax_indices[batch_index, slot_index].item())
+                reads.append(
+                    {
+                        "position": position,
+                        "token_id": token_ids[argmax_index],
+                        "token_logprob": float(
+                            token_logprobs[batch_index, slot_index].item()
+                        ),
+                        "entropy": float(entropies[batch_index, slot_index].item()),
+                        "token_ids": list(token_ids),
+                        "logprobs": logprobs[
+                            batch_index, slot_index, : len(token_ids)
+                        ].tolist(),
+                    }
+                )
+            results.append(reads)
+        return results
+
+    logits = model.diffusion_decoder_logits(
+        canvas,
+        cache=cache,
+        self_conditioning=None,
+        decoder_attention_mask=mask_mapping,
+    )[batch_indices, positions_array]
+    logprobs = logits.astype(mx.float32) - mx.logsumexp(
+        logits.astype(mx.float32), axis=-1, keepdims=True
+    )
+    argmax_ids = mx.argmax(logits, axis=-1)
+    token_logprobs = mx.take_along_axis(
+        logprobs, argmax_ids[..., None], axis=-1
+    ).squeeze(-1)
+    entropy_terms = mx.where(mx.isfinite(logprobs), mx.exp(logprobs) * logprobs, 0.0)
+    entropies = -mx.sum(entropy_terms, axis=-1)
+
+    selected_batch = []
+    for batch_index, slots in enumerate(slots_batch):
+        selected = []
+        for slot_index, (position, token_ids) in enumerate(slots):
+            row_logprobs = logprobs[batch_index, slot_index, mx.array(token_ids)]
+            mx.eval(
+                row_logprobs,
+                argmax_ids[batch_index, slot_index],
+                token_logprobs[batch_index, slot_index],
+                entropies[batch_index, slot_index],
+            )
+            selected.append(
+                {
+                    "position": position,
+                    "token_id": int(argmax_ids[batch_index, slot_index].item()),
+                    "token_logprob": float(
+                        token_logprobs[batch_index, slot_index].item()
+                    ),
+                    "entropy": float(entropies[batch_index, slot_index].item()),
+                    "token_ids": list(token_ids),
+                    "logprobs": row_logprobs.tolist(),
+                }
+            )
+        selected_batch.append(selected)
+    return selected_batch
+
+
+def _structured_candidate_graph_batch(
+    model,
+    input_ids,
+    seed_canvases,
+    slots_batch,
+    positions_batch,
+):
+    pending = []
+    for row, (seed_canvas, slots, positions) in enumerate(
+        zip(seed_canvases, slots_batch, positions_batch)
+    ):
+        row_input_ids = input_ids[row : row + 1]
+        cache = model.diffusion_prefill_cache(row_input_ids, cache=model.make_cache())
+        canvas = mx.array([seed_canvas], dtype=input_ids.dtype)
+        masks = model.diffusion_decoder_masks(canvas, cache)
+        hidden_states = _structured_decode(model, canvas, cache, masks)[
+            0, mx.array(positions)
+        ]
+
+        max_candidates = max(len(token_ids) for _, token_ids in slots)
+        padded_ids = []
+        candidate_masks = []
+        for _, token_ids in slots:
+            padding = max_candidates - len(token_ids)
+            padded_ids.append(token_ids + [token_ids[0]] * padding)
+            candidate_masks.append([True] * len(token_ids) + [False] * padding)
+        token_array = mx.array(padded_ids)
+        candidate_mask = mx.array(candidate_masks)
+        weights = model.model.decoder.embed_tokens(token_array)
+        logits = mx.matmul(
+            hidden_states.astype(mx.float32)[:, None, :],
+            mx.swapaxes(weights.astype(mx.float32), -1, -2),
+        ).squeeze(-2)
+        logits = model._softcap(logits)
+        logits = mx.where(candidate_mask, logits, -mx.inf)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        argmax_indices = mx.argmax(logits, axis=-1)
+        token_logprobs = mx.take_along_axis(
+            logprobs, argmax_indices[:, None], axis=-1
+        ).squeeze(-1)
+        entropy_terms = mx.where(candidate_mask, mx.exp(logprobs) * logprobs, 0.0)
+        entropies = -mx.sum(entropy_terms, axis=-1)
+        pending.append((logprobs, argmax_indices, token_logprobs, entropies))
+
+    mx.eval([value for values in pending for value in values])
+    results = []
+    for slots, values in zip(slots_batch, pending):
+        logprobs, argmax_indices, token_logprobs, entropies = values
+        reads = []
+        for slot_index, (position, token_ids) in enumerate(slots):
+            argmax_index = int(argmax_indices[slot_index].item())
+            reads.append(
+                {
+                    "position": position,
+                    "token_id": token_ids[argmax_index],
+                    "token_logprob": float(token_logprobs[slot_index].item()),
+                    "entropy": float(entropies[slot_index].item()),
+                    "token_ids": list(token_ids),
+                    "logprobs": logprobs[slot_index, : len(token_ids)].tolist(),
+                }
+            )
+        results.append(reads)
+    return results
+
+
+def _make_structured_decoder(decoder):
+    def forward(canvas, states, sliding_mask, full_mask):
+        hidden_states = decoder._embed_canvas(canvas, None, None)
+        offset = max(state[0].shape[2] for state in states)
+        for layer, state in zip(decoder.layers, states):
+            mask = sliding_mask if layer.self_attn.is_sliding else full_mask
+            hidden_states = layer(
+                hidden_states,
+                mask,
+                _StructuredDecoderCache(state, offset),
+                decoder=True,
+                offset=offset,
+            )
+        return decoder.norm(hidden_states)
+
+    return mx.compile(forward)
+
+
+def _structured_decode(model, canvas, cache, masks):
+    decoder = model.model.decoder
+    states = tuple(entry.state for entry in cache)
+    offset = cache[0].offset
+    if not (
+        len(decoder.layers) == 30
+        and decoder.config.hidden_size == 2816
+        and all(state[0] is not None for state in states)
+        and all(entry.offset == offset for entry in cache)
+        and offset == max(state[0].shape[2] for state in states)
+        and (
+            masks.get("sliding_attention") is None
+            or isinstance(masks.get("sliding_attention"), mx.array)
+        )
+        and (
+            masks.get("full_attention") is None
+            or isinstance(masks.get("full_attention"), mx.array)
+        )
+    ):
+        return decoder(canvas, cache=cache, decoder_attention_mask=masks)
+
+    compiled = getattr(decoder, "_structured_decoder", None)
+    if compiled is None:
+        compiled = _make_structured_decoder(decoder)
+        object.__setattr__(decoder, "_structured_decoder", compiled)
+    return compiled(
+        canvas,
+        states,
+        masks["sliding_attention"],
+        masks["full_attention"],
+    )
 
 
 def _decode_diffusion_masked_draft(

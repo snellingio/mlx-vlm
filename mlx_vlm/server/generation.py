@@ -33,6 +33,8 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
+    structured_diffusion_read,
+    structured_diffusion_read_batch,
 )
 from ..sample_utils import (
     apply_top_k,
@@ -49,6 +51,8 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
+DEFAULT_DIFFUSION_READ_BATCH_COALESCE_MS = 2.0
+DEFAULT_DIFFUSION_READ_MAX_BATCH_SIZE = 4
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
@@ -105,6 +109,28 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def get_diffusion_read_batch_coalesce_s():
+    raw = os.environ.get(
+        "MLX_VLM_DIFFUSION_READ_BATCH_COALESCE_MS",
+        str(DEFAULT_DIFFUSION_READ_BATCH_COALESCE_MS),
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_DIFFUSION_READ_BATCH_COALESCE_MS / 1000.0
+
+
+def get_diffusion_read_max_batch_size():
+    raw = os.environ.get(
+        "MLX_VLM_DIFFUSION_READ_MAX_BATCH_SIZE",
+        str(DEFAULT_DIFFUSION_READ_MAX_BATCH_SIZE),
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_DIFFUSION_READ_MAX_BATCH_SIZE
 
 
 def get_log_progress_interval():
@@ -760,6 +786,17 @@ class QueuedGenerationRequest:
 
 
 @dataclass
+class QueuedDiffusionReadRequest:
+    """Tokenized structured read waiting for the diffusion GPU worker."""
+
+    rqueue: Queue
+    input_ids: List[int]
+    seed_canvas: List[int]
+    slots: List[tuple[int, List[int]]]
+    candidate_only: bool = False
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -1227,6 +1264,53 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
+    def diffusion_read(
+        self,
+        input_ids: List[int],
+        seed_canvas: List[int],
+        slots: List[tuple[int, List[int]]],
+        *,
+        candidate_only: bool = False,
+    ) -> List[dict]:
+        """Queue one seeded, read-only diffusion forward on the GPU worker."""
+        self.wait_until_ready()
+        if not is_diffusion_model(self.model):
+            raise ValueError("structured diffusion reads require a diffusion model")
+        prompt_tokens = len(input_ids)
+        canvas_tokens = len(seed_canvas)
+        _check_configured_context_budget(prompt_tokens, canvas_tokens)
+        text_config = getattr(self.config, "text_config", None)
+        native_context_limit = getattr(text_config, "max_position_embeddings", None)
+        if native_context_limit is None and isinstance(text_config, dict):
+            native_context_limit = text_config.get("max_position_embeddings")
+        requested_tokens = prompt_tokens + canvas_tokens
+        if native_context_limit is not None and requested_tokens > native_context_limit:
+            raise PromptTooLongError(
+                "Request needs "
+                f"{requested_tokens} context tokens "
+                f"({prompt_tokens} prompt + {canvas_tokens} canvas), "
+                f"but the model limit is {native_context_limit}."
+            )
+        rqueue: Queue = Queue()
+        self.requests.put(
+            QueuedDiffusionReadRequest(
+                rqueue=rqueue,
+                input_ids=input_ids,
+                seed_canvas=seed_canvas,
+                slots=slots,
+                candidate_only=candidate_only,
+            )
+        )
+        try:
+            result = rqueue.get(timeout=get_token_queue_timeout())
+        except QueueEmpty as exc:
+            raise RuntimeError(
+                "Timed out waiting for a structured diffusion read"
+            ) from exc
+        if isinstance(result, Exception):
+            raise result
+        return result
+
     def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
@@ -1424,8 +1508,7 @@ class ResponseGenerator:
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
-                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%s",
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
@@ -1861,24 +1944,106 @@ class ResponseGenerator:
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
 
-    def _run_diffusion(self):
-        """GPU thread loop for diffusion models.
+    @staticmethod
+    def _diffusion_read_batch_key(request):
+        return (
+            len(request.input_ids),
+            len(request.seed_canvas),
+            len(request.slots),
+            request.candidate_only,
+        )
 
-        Diffusion generation runs one request at a time (batch size 1).
-        Output streams back block-by-block: one queue item per denoised
-        block, plus a final item carrying the finish reason. Non-streaming
-        endpoints aggregate the same items into a single response.
+    def _run_diffusion_read_batch(self, requests):
+        input_ids = mx.array(
+            [request.input_ids for request in requests], dtype=mx.int32
+        )
+        try:
+            results = structured_diffusion_read_batch(
+                self.model,
+                input_ids,
+                [request.seed_canvas for request in requests],
+                [request.slots for request in requests],
+                candidate_only=requests[0].candidate_only,
+            )
+            if len(results) != len(requests):
+                raise RuntimeError(
+                    "Structured diffusion batch returned incomplete results"
+                )
+        except Exception as batch_error:
+            if len(requests) == 1:
+                requests[0].rqueue.put(batch_error)
+                return
+            logger.exception("Error in batched structured diffusion read")
+            for request in requests:
+                try:
+                    result = structured_diffusion_read(
+                        self.model,
+                        mx.array([request.input_ids], dtype=mx.int32),
+                        request.seed_canvas,
+                        request.slots,
+                        candidate_only=request.candidate_only,
+                    )
+                    request.rqueue.put(result)
+                except Exception as error:
+                    logger.exception("Error in structured diffusion read")
+                    request.rqueue.put(error)
+            return
+
+        for request, result in zip(requests, results):
+            request.rqueue.put(result)
+
+    def _run_diffusion(self):
+        """GPU thread loop for diffusion generation and structured reads.
+
+        Generation runs one request at a time. Equal-shape structured reads
+        share one graph evaluation after a short queue wait.
         """
         uid_counter = 0
         cancelled: set = set()
         while not self._stop:
             try:
-                new_items, should_stop = self._collect_pending_requests(active=False)
+                new_items, should_stop = self._collect_pending_requests(
+                    active=False,
+                    capacity=1,
+                )
                 if should_stop:
                     break
+                max_read_batch = get_diffusion_read_max_batch_size()
+                if any(
+                    isinstance(request, QueuedDiffusionReadRequest)
+                    and request.candidate_only
+                    for request in new_items
+                ):
+                    time.sleep(get_diffusion_read_batch_coalesce_s())
+                    peers, peer_stop = self._collect_pending_requests(
+                        active=True,
+                        capacity=max(0, max_read_batch - len(new_items)),
+                    )
+                    new_items.extend(peers)
+                    should_stop = should_stop or peer_stop
                 cancelled |= self._drain_cancellations()
-                for request in new_items:
+                pending = deque(new_items)
+                while pending:
+                    request = pending.popleft()
                     rqueue = request.rqueue
+                    if isinstance(request, QueuedDiffusionReadRequest):
+                        key = self._diffusion_read_batch_key(request)
+                        batch = [request]
+                        remaining = deque()
+                        while pending:
+                            peer = pending.popleft()
+                            if (
+                                len(batch) < max_read_batch
+                                and isinstance(peer, QueuedDiffusionReadRequest)
+                                and self._diffusion_read_batch_key(peer) == key
+                            ):
+                                batch.append(peer)
+                            else:
+                                remaining.append(peer)
+                        pending = remaining
+                        self._run_diffusion_read_batch(batch)
+                        mx.clear_cache()
+                        continue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
                     args = request.args
@@ -1905,6 +2070,8 @@ class ResponseGenerator:
                         except Exception:
                             pass
                     mx.clear_cache()
+                if should_stop:
+                    break
             except Exception:
                 logger.exception("Error in diffusion generation thread")
                 mx.clear_cache()

@@ -1907,6 +1907,428 @@ class TestDiffusionVisualization(unittest.TestCase):
 
 
 class TestDiffusionBlockStreaming(unittest.TestCase):
+    def test_fused_gate_up_geglu_matches_separate_projection(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        mx.random.seed(0)
+        projection = QuantizedSwitchLinear(
+            input_dims=64,
+            output_dims=128,
+            num_experts=4,
+            bias=False,
+            group_size=64,
+            bits=4,
+        )
+        projection.scales = projection.scales.astype(mx.bfloat16)
+        projection.biases = projection.biases.astype(mx.bfloat16)
+        x = mx.random.normal((133, 1, 64)).astype(mx.bfloat16)
+        indices = ((mx.arange(133) * 4) // 133).astype(mx.uint32)
+
+        projected = projection(x, indices, sorted_indices=True)
+        gate, up = mx.split(projected, 2, axis=-1)
+        expected = nn.gelu_approx(gate) * up
+        fused = projection(
+            x,
+            indices,
+            sorted_indices=True,
+            fused_geglu=True,
+        )
+        mx.eval(expected, fused)
+        np.testing.assert_allclose(
+            np.array(fused.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            atol=0.02,
+        )
+
+    def test_fused_gate_up_falls_back_for_unsupported_width(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        mx.random.seed(0)
+        projection = QuantizedSwitchLinear(
+            input_dims=64,
+            output_dims=96,
+            num_experts=4,
+            bias=False,
+            group_size=64,
+            bits=4,
+        )
+        x = mx.random.normal((133, 1, 64)).astype(mx.bfloat16)
+        indices = ((mx.arange(133) * 4) // 133).astype(mx.uint32)
+        projected = projection(x, indices, sorted_indices=True)
+        gate, up = mx.split(projected, 2, axis=-1)
+        expected = nn.gelu_approx(gate) * up
+        output = projection(
+            x,
+            indices,
+            sorted_indices=True,
+            fused_geglu=True,
+        )
+        mx.eval(expected, output)
+        np.testing.assert_array_equal(np.array(output), np.array(expected))
+
+    def test_fused_gate_up_falls_back_on_cpu(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+
+        original_device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        try:
+            mx.random.seed(0)
+            projection = QuantizedSwitchLinear(
+                input_dims=64,
+                output_dims=128,
+                num_experts=4,
+                bias=False,
+                group_size=64,
+                bits=4,
+            )
+            x = mx.random.normal((64, 1, 64)).astype(mx.float32)
+            indices = ((mx.arange(64) * 4) // 64).astype(mx.uint32)
+            projected = projection(x, indices, sorted_indices=True)
+            gate, up = mx.split(projected, 2, axis=-1)
+            expected = nn.gelu_approx(gate) * up
+            output = projection(
+                x,
+                indices,
+                sorted_indices=True,
+                fused_geglu=True,
+            )
+            mx.eval(expected, output)
+            np.testing.assert_array_equal(np.array(output), np.array(expected))
+        finally:
+            mx.set_default_device(original_device)
+
+    def test_fused_quantized_experts_match_unfused_path(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.diffusion_gemma import ModelConfig
+        from mlx_vlm.models.diffusion_gemma.language import (
+            Experts,
+            _unsort_weighted_expert_reduce,
+        )
+        from mlx_vlm.models.switch_layers import _gather_sort
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["text_config"].update(
+            hidden_size=64,
+            moe_intermediate_size=64,
+            num_experts=4,
+            top_k_experts=2,
+        )
+        config = ModelConfig.from_dict(config_dict).text_config
+        experts = Experts(config)
+        nn.quantize(experts, group_size=64, bits=4, mode="affine")
+        experts.eval()
+
+        x = mx.random.normal((192, 64)).astype(mx.bfloat16)
+        indices = mx.stack(
+            (
+                mx.arange(192, dtype=mx.uint32) % 4,
+                (mx.arange(192, dtype=mx.uint32) + 1) % 4,
+            ),
+            axis=-1,
+        )
+        weights = mx.softmax(mx.random.normal((192, 2)), axis=-1)
+
+        sorted_x, sorted_indices, inverse = _gather_sort(
+            mx.expand_dims(x, (-2, -3)),
+            indices,
+        )
+        projected = experts.gate_up_proj(
+            sorted_x,
+            sorted_indices,
+            sorted_indices=True,
+        )
+        gate, up = mx.split(projected, 2, axis=-1)
+        activated = nn.gelu_approx(gate) * up
+        down = experts.down_proj(
+            activated,
+            sorted_indices,
+            sorted_indices=True,
+        )
+        expected = _unsort_weighted_expert_reduce(down, inverse, weights)
+        fused = experts(x, indices, weights)
+        mx.eval(expected, fused)
+
+        np.testing.assert_allclose(
+            np.array(fused.astype(mx.float32)),
+            np.array(expected.astype(mx.float32)),
+            rtol=0.02,
+            atol=0.03,
+        )
+
+    def test_quantized_expert_training_keeps_unfused_vjp(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.diffusion_gemma import ModelConfig
+        from mlx_vlm.models.diffusion_gemma.language import Experts
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["text_config"].update(
+            hidden_size=64,
+            moe_intermediate_size=64,
+            num_experts=4,
+            top_k_experts=2,
+        )
+        experts = Experts(ModelConfig.from_dict(config_dict).text_config)
+        nn.quantize(experts, group_size=64, bits=4, mode="affine")
+        experts.train()
+        indices = mx.stack(
+            (
+                mx.arange(32, dtype=mx.uint32) % 4,
+                (mx.arange(32, dtype=mx.uint32) + 1) % 4,
+            ),
+            axis=-1,
+        )
+        weights = mx.full((32, 2), 0.5)
+        x = mx.random.normal((32, 64)).astype(mx.float32)
+
+        gradient = mx.grad(lambda values: mx.sum(experts(values, indices, weights)))(x)
+        mx.eval(gradient)
+        self.assertTrue(bool(mx.all(mx.isfinite(gradient)).item()))
+
+    def test_lora_expert_gate_keeps_geglu_fallback(self):
+        from mlx_vlm.models.diffusion_gemma import ModelConfig
+        from mlx_vlm.models.diffusion_gemma.language import Experts
+        from mlx_vlm.trainer.lora_layers import LoRASwitchLinear
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["text_config"].update(
+            hidden_size=64,
+            moe_intermediate_size=64,
+            num_experts=4,
+            top_k_experts=2,
+        )
+        experts = Experts(ModelConfig.from_dict(config_dict).text_config)
+        experts.gate_up_proj = LoRASwitchLinear.from_base(
+            experts.gate_up_proj,
+            r=4,
+        )
+        experts.eval()
+        x = mx.random.normal((32, 64))
+        indices = mx.stack(
+            (
+                mx.arange(32, dtype=mx.uint32) % 4,
+                (mx.arange(32, dtype=mx.uint32) + 1) % 4,
+            ),
+            axis=-1,
+        )
+        weights = mx.full((32, 2), 0.5)
+
+        output = experts(x, indices, weights)
+        mx.eval(output)
+        self.assertEqual(output.shape, x.shape)
+        self.assertTrue(bool(mx.all(mx.isfinite(output)).item()))
+
+    def test_fused_expert_reductions_match_unfused_math(self):
+        from mlx_vlm.models.diffusion_gemma.language import (
+            _unsort_weighted_expert_reduce,
+            _weighted_expert_reduce,
+        )
+
+        mx.random.seed(0)
+        weights = mx.random.uniform(shape=(3, 2)).astype(mx.float16)
+        values = mx.random.uniform(shape=(3, 2, 1, 16)).astype(mx.float16)
+        direct = (values.squeeze(-2) * weights[..., None]).sum(axis=-2)
+        fused_direct = _weighted_expert_reduce(values, weights)
+
+        order = mx.array([2, 5, 0, 3, 1, 4])
+        inverse = mx.argsort(order)
+        sorted_values = values.reshape(6, 1, 16)[order]
+        fused_sorted = _unsort_weighted_expert_reduce(
+            sorted_values,
+            inverse,
+            weights,
+        )
+        mx.eval(direct, fused_direct, fused_sorted)
+        np.testing.assert_array_equal(np.array(direct), np.array(fused_direct))
+        np.testing.assert_array_equal(np.array(direct), np.array(fused_sorted))
+
+        larger_weights = mx.random.uniform(shape=(9, 8)).astype(mx.float16)
+        larger_values = mx.random.uniform(shape=(9, 8, 1, 16)).astype(mx.float16)
+        larger_order = mx.argsort(mx.random.uniform(shape=(72,)))
+        larger_inverse = mx.argsort(larger_order)
+        larger_sorted = larger_values.reshape(72, 1, 16)[larger_order]
+        larger_direct = (larger_values.squeeze(-2) * larger_weights[..., None]).sum(
+            axis=-2
+        )
+        larger_fused = _unsort_weighted_expert_reduce(
+            larger_sorted,
+            larger_inverse,
+            larger_weights,
+        )
+        mx.eval(larger_direct, larger_fused)
+        np.testing.assert_array_equal(
+            np.array(larger_direct),
+            np.array(larger_fused),
+        )
+
+    def test_compiled_structured_decoder_matches_eager_decoder(self):
+        from mlx_vlm.generate.diffusion import _make_structured_decoder
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        compiled = _make_structured_decoder(model.model.decoder)
+        for prompt_length, canvas_length in ((2, 1), (10, 3), (6, 8)):
+            with self.subTest(
+                prompt_length=prompt_length,
+                canvas_length=canvas_length,
+            ):
+                input_ids = mx.arange(prompt_length, dtype=mx.int32)[None]
+                cache = model.diffusion_prefill_cache(
+                    input_ids,
+                    cache=model.make_cache(),
+                )
+                canvas = mx.arange(4, 4 + canvas_length, dtype=mx.int32)[None]
+                masks = model.diffusion_decoder_masks(canvas, cache, None)
+                eager = model.model.decoder(
+                    canvas,
+                    cache=cache,
+                    decoder_attention_mask=masks,
+                )
+                candidate = compiled(
+                    canvas,
+                    tuple(entry.state for entry in cache),
+                    masks["sliding_attention"],
+                    masks["full_attention"],
+                )
+                mx.eval(eager, candidate)
+                np.testing.assert_allclose(
+                    np.array(eager),
+                    np.array(candidate),
+                    rtol=1e-5,
+                    atol=2e-6,
+                )
+
+    def test_structured_candidate_batch_matches_single_reads(self):
+        from mlx_vlm.generate.diffusion import (
+            structured_diffusion_read,
+            structured_diffusion_read_batch,
+        )
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        input_ids = mx.array([[2, 3], [8, 9]], dtype=mx.int32)
+        canvases = [[4, 5, 6], [10, 11, 12]]
+        slots_batch = [
+            [(0, [7, 8]), (2, [9, 10, 11])],
+            [(1, [2, 3, 4]), (2, [5, 6])],
+        ]
+
+        batched = structured_diffusion_read_batch(
+            model,
+            input_ids,
+            canvases,
+            slots_batch,
+            candidate_only=True,
+        )
+        singles = [
+            structured_diffusion_read(
+                model,
+                input_ids[index],
+                canvases[index],
+                slots_batch[index],
+                candidate_only=True,
+            )
+            for index in range(2)
+        ]
+
+        for batch_reads, single_reads in zip(batched, singles):
+            self.assertEqual(
+                [read["token_id"] for read in batch_reads],
+                [read["token_id"] for read in single_reads],
+            )
+            for batch_read, single_read in zip(batch_reads, single_reads):
+                np.testing.assert_array_equal(
+                    batch_read["logprobs"],
+                    single_read["logprobs"],
+                )
+
+    def test_structured_read_returns_exact_temperature_one_logprobs(self):
+        from mlx_vlm.generate.diffusion import structured_diffusion_read
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        input_ids = mx.array([[2, 3]], dtype=mx.int32)
+        seed_canvas = [4, 5, 6]
+        slots = [(0, [7, 8]), (2, [9, 10, 11])]
+
+        result = structured_diffusion_read(model, input_ids, seed_canvas, slots)
+
+        self.assertEqual([item["position"] for item in result], [0, 2])
+        self.assertEqual(result[0]["token_ids"], [7, 8])
+        self.assertEqual(result[1]["token_ids"], [9, 10, 11])
+        self.assertEqual(len(result[0]["logprobs"]), 2)
+        self.assertEqual(len(result[1]["logprobs"]), 3)
+        self.assertTrue(all(np.isfinite(item["token_logprob"]) for item in result))
+        self.assertTrue(all(np.isfinite(item["entropy"]) for item in result))
+        self.assertTrue(all(item["entropy"] >= 0 for item in result))
+        self.assertTrue(
+            all(np.isfinite(value) for item in result for value in item["logprobs"])
+        )
+
+    def test_structured_read_validates_canvas_and_slots_before_inference(self):
+        from mlx_vlm.generate.diffusion import structured_diffusion_read
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        input_ids = mx.array([[2, 3]], dtype=mx.int32)
+
+        with self.assertRaisesRegex(ValueError, "between 1 and 3 ids"):
+            structured_diffusion_read(model, input_ids, [4, 5, 6, 7], [(0, [7])])
+        with self.assertRaisesRegex(ValueError, "input_ids"):
+            structured_diffusion_read(model, mx.array([[999]]), [4, 5, 6], [(0, [7])])
+        with self.assertRaisesRegex(ValueError, "duplicated"):
+            structured_diffusion_read(
+                model,
+                input_ids,
+                [4, 5, 6],
+                [(0, [7]), (0, [8])],
+            )
+
+    def test_structured_candidate_read_accepts_short_canvas(self):
+        from mlx_vlm.generate.diffusion import structured_diffusion_read
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        result = structured_diffusion_read(
+            model,
+            mx.array([[2, 3]], dtype=mx.int32),
+            [4],
+            [(0, [7, 8])],
+            candidate_only=True,
+        )
+        full_result = structured_diffusion_read(
+            model,
+            mx.array([[2, 3]], dtype=mx.int32),
+            [4],
+            [(0, [7, 8])],
+        )
+        self.assertEqual(result[0]["position"], 0)
+        self.assertIn(result[0]["token_id"], [7, 8])
+        self.assertEqual(result[0]["token_ids"], [7, 8])
+        self.assertAlmostEqual(sum(np.exp(result[0]["logprobs"])), 1.0, places=5)
+        full_probs = np.exp(full_result[0]["logprobs"])
+        full_probs /= full_probs.sum()
+        np.testing.assert_allclose(
+            np.exp(result[0]["logprobs"]),
+            full_probs,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
     def test_stream_generate_emits_block_boundaries(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -2266,6 +2688,31 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
         )
         for mask in text_masks:
             self.assertFalse(isinstance(mask, mx.array) and mask.shape == (1, 1, 4, 4))
+
+    def test_vision_mask_output_matches_explicit_window_fallback(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_vision_config_dict())
+        model = Model(config)
+        input_ids = mx.array([[2, config.image_token_id, config.image_token_id, 3]])
+        token_types = mx.array([[0, 1, 1, 0]])
+
+        output, _ = model.model.encoder(
+            input_ids,
+            mm_token_type_ids=token_types,
+        )
+        with patch(
+            "mlx_vlm.models.diffusion_gemma.language.supports_fast_sdpa_window_size",
+            return_value=False,
+        ):
+            expected, _ = model.model.encoder(
+                input_ids,
+                mm_token_type_ids=token_types,
+            )
+
+        mx.eval(output, expected)
+        np.testing.assert_allclose(np.array(output), np.array(expected), atol=1e-5)
 
     def test_stream_generate_with_image_inputs(self):
         from mlx_vlm.generate import stream_generate

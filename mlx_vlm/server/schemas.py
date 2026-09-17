@@ -42,6 +42,63 @@ class FlexibleBaseModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class DiffusionReadSlot(BaseModel):
+    position: int = Field(..., ge=0, description="Canvas position to read.")
+    token_ids: List[int] = Field(
+        ...,
+        min_length=1,
+        max_length=8192,
+        description="Exact vocabulary token IDs to score.",
+    )
+
+
+class DiffusionReadRequest(BaseModel):
+    model: str = Field(..., description="Loaded DiffusionGemma model or snapshot path.")
+    input_ids: List[int] = Field(
+        ...,
+        min_length=1,
+        max_length=262144,
+        description="Tokenized encoder prompt.",
+    )
+    seed_canvas: List[int] = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Active decoder canvas, up to the checkpoint canvas length.",
+    )
+    slots: List[DiffusionReadSlot] = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Canvas positions and token IDs to read.",
+    )
+    candidate_only: bool = Field(
+        False,
+        description="Score only requested token IDs and skip the full vocabulary head.",
+    )
+
+
+class DiffusionReadResult(BaseModel):
+    position: int
+    token_id: int
+    token_logprob: float
+    entropy: float
+    token_ids: List[int]
+    logprobs: List[float]
+
+
+class DiffusionReadUsage(BaseModel):
+    prompt_tokens: int
+    denoising_steps: int = 1
+    candidate_only: bool
+
+
+class DiffusionReadResponse(BaseModel):
+    model: str
+    reads: List[DiffusionReadResult]
+    usage: DiffusionReadUsage
+
+
 # OpenAI API Models
 
 
