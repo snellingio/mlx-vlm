@@ -33,6 +33,7 @@ from ..generate import (  # noqa: F401 - compatibility re-exported by server.__i
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
+    structured_diffusion_read,
 )
 from ..sample_utils import (
     apply_top_k,
@@ -760,6 +761,18 @@ class QueuedGenerationRequest:
 
 
 @dataclass
+class QueuedDiffusionReadRequest:
+    """Tokenized structured read waiting for the diffusion GPU worker."""
+
+    rqueue: Queue
+    input_ids: List[int]
+    seed_canvas: List[int]
+    slots: List[tuple[int, List[int]]]
+    candidate_only: bool = False
+    encoder_layers: Optional[int] = None
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -1227,6 +1240,55 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
+    def diffusion_read(
+        self,
+        input_ids: List[int],
+        seed_canvas: List[int],
+        slots: List[tuple[int, List[int]]],
+        *,
+        candidate_only: bool = False,
+        encoder_layers: Optional[int] = None,
+    ) -> List[dict]:
+        """Queue one seeded, read-only diffusion forward on the GPU worker."""
+        self.wait_until_ready()
+        if not is_diffusion_model(self.model):
+            raise ValueError("structured diffusion reads require a diffusion model")
+        prompt_tokens = len(input_ids)
+        canvas_tokens = len(seed_canvas)
+        _check_configured_context_budget(prompt_tokens, canvas_tokens)
+        text_config = getattr(self.config, "text_config", None)
+        native_context_limit = getattr(text_config, "max_position_embeddings", None)
+        if native_context_limit is None and isinstance(text_config, dict):
+            native_context_limit = text_config.get("max_position_embeddings")
+        requested_tokens = prompt_tokens + canvas_tokens
+        if native_context_limit is not None and requested_tokens > native_context_limit:
+            raise PromptTooLongError(
+                "Request needs "
+                f"{requested_tokens} context tokens "
+                f"({prompt_tokens} prompt + {canvas_tokens} canvas), "
+                f"but the model limit is {native_context_limit}."
+            )
+        rqueue: Queue = Queue()
+        self.requests.put(
+            QueuedDiffusionReadRequest(
+                rqueue=rqueue,
+                input_ids=input_ids,
+                seed_canvas=seed_canvas,
+                slots=slots,
+                candidate_only=candidate_only,
+                encoder_layers=encoder_layers,
+            )
+        )
+        try:
+            result = rqueue.get(timeout=get_token_queue_timeout())
+        except QueueEmpty as exc:
+            raise RuntimeError(
+                "Timed out waiting for a structured diffusion read"
+            ) from exc
+        if isinstance(result, Exception):
+            raise result
+        return result
+
     def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
@@ -1424,8 +1486,7 @@ class ResponseGenerator:
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
-                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%s",
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
@@ -1879,6 +1940,23 @@ class ResponseGenerator:
                 cancelled |= self._drain_cancellations()
                 for request in new_items:
                     rqueue = request.rqueue
+                    if isinstance(request, QueuedDiffusionReadRequest):
+                        try:
+                            input_ids = mx.array([request.input_ids], dtype=mx.int32)
+                            result = structured_diffusion_read(
+                                self.model,
+                                input_ids,
+                                request.seed_canvas,
+                                request.slots,
+                                candidate_only=request.candidate_only,
+                                encoder_layers=request.encoder_layers,
+                            )
+                            rqueue.put(result)
+                        except Exception as error:
+                            logger.exception("Error in structured diffusion read")
+                            rqueue.put(error)
+                        mx.clear_cache()
+                        continue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
                     args = request.args

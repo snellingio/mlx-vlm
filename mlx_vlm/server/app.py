@@ -6,7 +6,7 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
-from threading import Lock
+from threading import Lock, RLock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -55,13 +55,21 @@ from .runtime import (
     ModelCacheRegistry,
     runtime,
 )
-from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
+from .schemas import (
+    ChatLogprobContent,
+    DiffusionReadRequest,
+    DiffusionReadResponse,
+    ModelsResponse,
+    TopLogprob,
+)
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
+MAX_DIFFUSION_READ_TOKEN_IDS = 262_144
+_MODEL_CACHE_LOCK = RLock()
 
 _as_plain_dict = _request_normalization._as_plain_dict
 
@@ -555,6 +563,21 @@ def get_cached_model(
     *,
     model_kind: str = "auto",
 ):
+    """Load or return one cache entry without concurrent cache switches."""
+    with _MODEL_CACHE_LOCK:
+        return _get_cached_model_unlocked(
+            model_path,
+            adapter_path,
+            model_kind=model_kind,
+        )
+
+
+def _get_cached_model_unlocked(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
@@ -923,6 +946,12 @@ def get_cached_model(
 
 # Synchronous unload function for internal use
 def unload_model_sync():
+    """Unload model caches without racing an active cache-bound read."""
+    with _MODEL_CACHE_LOCK:
+        return _unload_model_sync_unlocked()
+
+
+def _unload_model_sync_unlocked():
     unloaded_any = False
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
@@ -989,6 +1018,75 @@ register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
+
+
+def _run_cached_diffusion_read(
+    model_path,
+    input_ids,
+    seed_canvas,
+    slots,
+    *,
+    candidate_only=False,
+    encoder_layers=None,
+):
+    """Load, bind, and keep the exact worker alive for one structured read."""
+    with _MODEL_CACHE_LOCK:
+        _get_cached_model_unlocked(model_path, None)
+        cache = _model_cache_registry().for_kind("text_generation")
+        generator = cache.get("response_generator")
+        served_model = cache.get("model_path")
+        if generator is None or served_model != model_path:
+            raise ValueError(
+                f"model cache did not retain requested model {model_path!r}"
+            )
+        if getattr(generator, "model_path", None) != served_model:
+            raise ValueError("model cache and text generation worker do not match")
+        reads = generator.diffusion_read(
+            input_ids,
+            seed_canvas,
+            slots,
+            candidate_only=candidate_only,
+            encoder_layers=encoder_layers,
+        )
+        return served_model, reads
+
+
+@inference_router.post("/v1/diffusion/reads", response_model=DiffusionReadResponse)
+async def diffusion_reads_endpoint(read_request: DiffusionReadRequest):
+    """Read exact token probabilities from one seeded DiffusionGemma canvas."""
+    try:
+        requested_token_ids = sum(len(slot.token_ids) for slot in read_request.slots)
+        if requested_token_ids > MAX_DIFFUSION_READ_TOKEN_IDS:
+            raise ValueError(
+                "structured diffusion read requests may score at most "
+                f"{MAX_DIFFUSION_READ_TOKEN_IDS} token IDs"
+            )
+        slots = [(slot.position, slot.token_ids) for slot in read_request.slots]
+        served_model, reads = await asyncio.to_thread(
+            _run_cached_diffusion_read,
+            read_request.model,
+            read_request.input_ids,
+            read_request.seed_canvas,
+            slots,
+            candidate_only=read_request.candidate_only,
+            encoder_layers=read_request.encoder_layers,
+        )
+        return DiffusionReadResponse(
+            model=served_model,
+            reads=reads,
+            usage={
+                "prompt_tokens": len(read_request.input_ids),
+                "candidate_only": read_request.candidate_only,
+                "encoder_layers": read_request.encoder_layers,
+            },
+        )
+    except HTTPException:
+        raise
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("Structured diffusion read failed: %s", error)
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 @inference_router.get("/models", response_model=ModelsResponse)

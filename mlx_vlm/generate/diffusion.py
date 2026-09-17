@@ -32,6 +32,76 @@ DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
 
 
+_STRUCTURED_ROTARY_TABLES = {}
+
+
+_SLIDING_KV_FINALIZE_SOURCE = r"""
+    uint dim = thread_index_in_threadgroup;
+    uint token = threadgroup_position_in_grid.y;
+    uint head = threadgroup_position_in_grid.z;
+    const device T* row = projected +
+        (size_t)token * (2u * HEADS * DIMS);
+    uint source = head * DIMS + dim;
+    float key = (float)row[source];
+    float value = (float)row[HEADS * DIMS + source];
+    uint lane = thread_index_in_simdgroup;
+    uint simdgroup = simdgroup_index_in_threadgroup;
+    threadgroup float sums[16];
+    threadgroup float inverse[2];
+    float key_sum = simd_sum(key * key);
+    float value_sum = simd_sum(value * value);
+    if (lane == 0) {
+        sums[simdgroup] = key_sum;
+        sums[8u + simdgroup] = value_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float key_total = lane < 8u ? sums[lane] : 0.0f;
+        float value_total = lane < 8u ? sums[8u + lane] : 0.0f;
+        key_total = simd_sum(key_total);
+        value_total = simd_sum(value_total);
+        if (lane == 0) {
+            inverse[0] = metal::rsqrt(key_total / (float)DIMS + 1.0e-6f);
+            inverse[1] = metal::rsqrt(value_total / (float)DIMS + 1.0e-6f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint half_dims = DIMS / 2u;
+    uint pair_dim = dim < half_dims ? dim + half_dims : dim - half_dims;
+    float pair_key = (float)row[head * DIMS + pair_dim];
+    T normalized_key = (T)(key * inverse[0] * (float)norm[dim]);
+    T normalized_pair =
+        (T)(pair_key * inverse[0] * (float)norm[pair_dim]);
+    uint rotary_dim = dim < half_dims ? dim : dim - half_dims;
+    float cosine = (float)cosines[token * half_dims + rotary_dim];
+    float sine = (float)sines[token * half_dims + rotary_dim];
+    float rotated = dim < half_dims
+        ? (float)normalized_key * cosine - (float)normalized_pair * sine
+        : (float)normalized_key * cosine + (float)normalized_pair * sine;
+    size_t target = ((size_t)head * LENGTH + token) * DIMS + dim;
+    keys[target] = (T)rotated;
+    values[target] = (T)(value * inverse[1]);
+"""
+
+
+_sliding_kv_finalize_kernel = mx.fast.metal_kernel(
+    name="diffusion_gemma_sliding_kv_finalize",
+    input_names=["projected", "norm", "cosines", "sines"],
+    output_names=["keys", "values"],
+    source=_SLIDING_KV_FINALIZE_SOURCE,
+)
+
+
+class _StructuredDecoderCache:
+    def __init__(self, state, offset):
+        self.keys, self.values = state
+        self.offset = offset
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
     terminal_width = shutil.get_terminal_size((120, 20)).columns
     requested_width = requested_width or DEFAULT_DIFFUSION_UNMASKING_WIDTH
@@ -500,6 +570,394 @@ def _make_diffusion_decoder_logits_fns(
     if compile_graph:
         return mx.compile(without_self_conditioning), mx.compile(with_self_conditioning)
     return without_self_conditioning, with_self_conditioning
+
+
+def structured_diffusion_read(
+    model: nn.Module,
+    input_ids: mx.array,
+    seed_canvas: List[int],
+    slots: List[tuple[int, List[int]]],
+    *,
+    candidate_only: bool = False,
+    encoder_layers: Optional[int] = None,
+) -> List[dict]:
+    """Run one read-only denoising step over a caller-provided canvas.
+
+    Each slot names one canvas position and the exact vocabulary token IDs to
+    read there. Candidate-only reads normalize over those requested IDs. Other
+    reads use the full temperature-1 vocabulary distribution. The canvas is
+    never committed to the KV cache.
+    """
+    if input_ids.ndim == 1:
+        input_ids = input_ids[None]
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError("input_ids must contain one non-empty prompt")
+
+    max_canvas_length = int(model.config.canvas_length)
+    vocab_size = int(model.config.text_config.vocab_size)
+    if bool(mx.any(input_ids < 0).item()) or bool(
+        mx.any(input_ids >= vocab_size).item()
+    ):
+        raise ValueError("input_ids contains a token id outside the model vocabulary")
+    if not seed_canvas or len(seed_canvas) > max_canvas_length:
+        raise ValueError(
+            "seed_canvas must hold between 1 and "
+            f"{max_canvas_length} ids, got {len(seed_canvas)}"
+        )
+    if any(token_id < 0 or token_id >= vocab_size for token_id in seed_canvas):
+        raise ValueError("seed_canvas contains a token id outside the model vocabulary")
+    if not slots:
+        raise ValueError("at least one read slot is required")
+
+    positions = []
+    for position, token_ids in slots:
+        if position < 0 or position >= len(seed_canvas):
+            raise ValueError(f"read slot position {position} is outside the canvas")
+        if position in positions:
+            raise ValueError(f"read slot position {position} is duplicated")
+        if not token_ids:
+            raise ValueError(f"read slot position {position} has no token ids")
+        if len(token_ids) != len(set(token_ids)):
+            raise ValueError(f"read slot position {position} has duplicate token ids")
+        if any(token_id < 0 or token_id >= vocab_size for token_id in token_ids):
+            raise ValueError(
+                f"read slot position {position} contains a token id outside the model vocabulary"
+            )
+        positions.append(position)
+
+    cache = _structured_diffusion_prefill_cache(
+        model,
+        input_ids,
+        encoder_layers=encoder_layers,
+    )
+    mx.eval([entry.state for entry in cache])
+
+    canvas = mx.array([seed_canvas], dtype=input_ids.dtype)
+    mask_mapping = model.diffusion_decoder_masks(canvas, cache)
+    if candidate_only:
+        hidden_states = _structured_one_token_decode(
+            model,
+            canvas,
+            cache,
+            mask_mapping,
+        )[0, mx.array(positions)]
+        pending = []
+        for row, (_, token_ids) in enumerate(slots):
+            token_array = mx.array(token_ids)
+            weights = model.model.decoder.embed_tokens(token_array)
+            logits = model._softcap(
+                hidden_states[row].astype(mx.float32) @ weights.astype(mx.float32).T
+            )
+            logprobs = logits - mx.logsumexp(logits)
+            argmax_index = mx.argmax(logits)
+            token_logprob = logprobs[argmax_index]
+            entropy_terms = mx.where(
+                mx.isfinite(logprobs), mx.exp(logprobs) * logprobs, 0.0
+            )
+            pending.append(
+                (
+                    logprobs,
+                    argmax_index,
+                    token_logprob,
+                    -mx.sum(entropy_terms),
+                )
+            )
+
+        mx.eval([value for values in pending for value in values])
+        return [
+            {
+                "position": position,
+                "token_id": token_ids[int(values[1].item())],
+                "token_logprob": float(values[2].item()),
+                "entropy": float(values[3].item()),
+                "token_ids": list(token_ids),
+                "logprobs": values[0].tolist(),
+            }
+            for (position, token_ids), values in zip(slots, pending)
+        ]
+
+    logits = model.diffusion_decoder_logits(
+        canvas,
+        cache=cache,
+        self_conditioning=None,
+        decoder_attention_mask=mask_mapping,
+    )[0, mx.array(positions)]
+    logprobs = logits.astype(mx.float32) - mx.logsumexp(
+        logits.astype(mx.float32), axis=-1, keepdims=True
+    )
+    argmax_ids = mx.argmax(logits, axis=-1)
+    token_logprobs = mx.take_along_axis(logprobs, argmax_ids[:, None], axis=-1).squeeze(
+        -1
+    )
+    entropy_terms = mx.where(mx.isfinite(logprobs), mx.exp(logprobs) * logprobs, 0.0)
+    entropies = -mx.sum(entropy_terms, axis=-1)
+
+    selected = []
+    for row, (position, token_ids) in enumerate(slots):
+        row_logprobs = logprobs[row, mx.array(token_ids)]
+        mx.eval(
+            row_logprobs,
+            argmax_ids[row],
+            token_logprobs[row],
+            entropies[row],
+        )
+        selected.append(
+            {
+                "position": position,
+                "token_id": int(argmax_ids[row].item()),
+                "token_logprob": float(token_logprobs[row].item()),
+                "entropy": float(entropies[row].item()),
+                "token_ids": list(token_ids),
+                "logprobs": row_logprobs.tolist(),
+            }
+        )
+    return selected
+
+
+def _structured_rotary_tables(length, dims, dtype, base, offset=0):
+    key = (offset, length, dims, dtype, base)
+    tables = _STRUCTURED_ROTARY_TABLES.get(key)
+    if tables is None:
+        positions = mx.arange(offset, offset + length, dtype=mx.float32)[:, None]
+        frequencies = mx.power(
+            mx.array(base, dtype=mx.float32),
+            -2 * mx.arange(dims // 2, dtype=mx.float32) / dims,
+        )[None]
+        angles = positions * frequencies
+        tables = mx.cos(angles).astype(dtype), mx.sin(angles).astype(dtype)
+        if len(_STRUCTURED_ROTARY_TABLES) >= 16:
+            _STRUCTURED_ROTARY_TABLES.pop(next(iter(_STRUCTURED_ROTARY_TABLES)))
+        _STRUCTURED_ROTARY_TABLES[key] = tables
+    return tables
+
+
+def _structured_sliding_kv(attention, normalized, *, offset=0):
+    k_proj = attention.k_proj
+    v_proj = attention.v_proj
+    if not (
+        mx.default_device() == mx.gpu
+        and normalized.shape[0] == 1
+        and normalized.dtype == mx.bfloat16
+        and attention.n_kv_heads == 8
+        and attention.head_dim == 256
+        and v_proj is not None
+        and getattr(k_proj, "bits", None) == 8
+        and getattr(v_proj, "bits", None) == 8
+        and getattr(k_proj, "group_size", None) == 64
+        and getattr(v_proj, "group_size", None) == 64
+        and getattr(k_proj, "mode", "affine") == "affine"
+        and getattr(v_proj, "mode", "affine") == "affine"
+        and getattr(k_proj, "biases", None) is not None
+        and getattr(v_proj, "biases", None) is not None
+        and "bias" not in k_proj
+        and "bias" not in v_proj
+        and k_proj.scales.dtype == normalized.dtype
+        and v_proj.scales.dtype == normalized.dtype
+        and k_proj.biases.dtype == normalized.dtype
+        and v_proj.biases.dtype == normalized.dtype
+        and attention.k_norm.weight.dtype == normalized.dtype
+        and attention.rope.dims == attention.head_dim
+        and not attention.rope.traditional
+        and attention.rope.scale == 1.0
+        and attention.k_norm.eps == 1e-6
+        and attention.v_norm.eps == 1e-6
+    ):
+        return None
+
+    parameters = getattr(attention, "_structured_fused_kv_parameters", None)
+    if parameters is None:
+        parameters = tuple(
+            mx.concatenate([getattr(k_proj, name), getattr(v_proj, name)], axis=0)
+            for name in ("weight", "scales", "biases")
+        )
+        object.__setattr__(
+            attention,
+            "_structured_fused_kv_parameters",
+            parameters,
+        )
+
+    weight, scales, biases = parameters
+    projected = mx.quantized_matmul(
+        normalized,
+        weight,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=64,
+        bits=8,
+        mode="affine",
+    )
+    length = normalized.shape[1]
+    cosines, sines = _structured_rotary_tables(
+        length,
+        attention.head_dim,
+        normalized.dtype,
+        attention.rope.base,
+        offset,
+    )
+    return _sliding_kv_finalize_kernel(
+        inputs=[
+            projected,
+            attention.k_norm.weight,
+            cosines,
+            sines,
+        ],
+        template=[
+            ("T", normalized.dtype),
+            ("HEADS", attention.n_kv_heads),
+            ("DIMS", attention.head_dim),
+            ("LENGTH", length),
+        ],
+        grid=(256, length, attention.n_kv_heads),
+        threadgroup=(256, 1, 1),
+        output_shapes=[
+            (1, attention.n_kv_heads, length, attention.head_dim),
+            (1, attention.n_kv_heads, length, attention.head_dim),
+        ],
+        output_dtypes=[normalized.dtype, normalized.dtype],
+    )
+
+
+def _trim_structured_sliding_cache(entry, prompt_length, window_prefix):
+    """Keep the decoder-visible tail while preserving the RoPE offset."""
+    if window_prefix and entry.state[0].shape[2] > window_prefix:
+        keys, values = entry.state
+        entry.state = (
+            keys[:, :, -window_prefix:, :],
+            values[:, :, -window_prefix:, :],
+        )
+        entry._idx = window_prefix
+    entry.offset = prompt_length
+
+
+def _make_structured_one_token_decoder(decoder):
+    def forward(canvas, states, sliding_mask, full_mask):
+        hidden_states = decoder._embed_canvas(canvas, None, None)
+        offset = max(state[0].shape[2] for state in states)
+        for layer, state in zip(decoder.layers, states):
+            mask = sliding_mask if layer.self_attn.is_sliding else full_mask
+            hidden_states = layer(
+                hidden_states,
+                mask,
+                _StructuredDecoderCache(state, offset),
+                decoder=True,
+                offset=offset,
+            )
+        return decoder.norm(hidden_states)
+
+    return mx.compile(forward)
+
+
+def _structured_one_token_decode(model, canvas, cache, masks):
+    decoder = model.model.decoder
+    states = tuple(entry.state for entry in cache)
+    offset = cache[0].offset
+    if not (
+        canvas.shape == (1, 1)
+        and len(decoder.layers) == 30
+        and decoder.config.hidden_size == 2816
+        and all(state[0] is not None for state in states)
+        and all(entry.offset == offset for entry in cache)
+        and offset == max(state[0].shape[2] for state in states)
+        and (
+            masks.get("sliding_attention") is None
+            or isinstance(masks.get("sliding_attention"), mx.array)
+        )
+        and (
+            masks.get("full_attention") is None
+            or isinstance(masks.get("full_attention"), mx.array)
+        )
+    ):
+        return decoder(canvas, cache=cache, decoder_attention_mask=masks)
+
+    compiled = getattr(decoder, "_structured_one_token_decoder", None)
+    if compiled is None:
+        compiled = _make_structured_one_token_decoder(decoder)
+        object.__setattr__(decoder, "_structured_one_token_decoder", compiled)
+    return compiled(
+        canvas,
+        states,
+        masks["sliding_attention"],
+        masks["full_attention"],
+    )
+
+
+def _structured_diffusion_prefill_cache(model, input_ids, *, encoder_layers=None):
+    """Build a full or reduced-compute encoder cache for one structured read."""
+    cache = model.make_cache()
+    if encoder_layers is None:
+        return model.diffusion_prefill_cache(input_ids, cache=cache)
+
+    decoder = model.model.decoder
+    encoder = model.model.encoder
+    layers = decoder.layers
+    if encoder_layers < 0 or encoder_layers > len(layers):
+        raise ValueError(
+            f"encoder_layers must be between 0 and {len(layers)}, got {encoder_layers}"
+        )
+
+    hidden_states = encoder._embed_inputs(input_ids)
+    masks = encoder._make_encoder_masks(hidden_states, cache)
+    prompt_length = hidden_states.shape[1]
+    window_prefix = max(decoder.config.sliding_window - 1, 0)
+    for index, (layer, entry, mask) in enumerate(zip(layers, cache, masks)):
+        if index < encoder_layers:
+            hidden_states = layer(
+                hidden_states,
+                mask,
+                entry,
+                decoder=False,
+                layer_scalar=encoder.language_model.layers[index].layer_scalar,
+            )
+            if layer.self_attn.is_sliding:
+                _trim_structured_sliding_cache(
+                    entry,
+                    prompt_length,
+                    window_prefix,
+                )
+            continue
+
+        attention = layer.self_attn
+        rope_offset = 0
+        cache_input = hidden_states
+        if attention.is_sliding and window_prefix:
+            rope_offset = max(0, prompt_length - window_prefix)
+            cache_input = hidden_states[:, rope_offset:]
+
+        normalized = layer.input_layernorm(cache_input)
+        batch, length, _ = normalized.shape
+        fused_kv = _structured_sliding_kv(
+            attention,
+            normalized,
+            offset=rope_offset,
+        )
+        if fused_kv is not None:
+            keys, values = fused_kv
+        else:
+            keys = attention.k_proj(normalized).reshape(
+                batch,
+                length,
+                attention.n_kv_heads,
+                attention.head_dim,
+            )
+            values = (
+                attention.v_proj(normalized).reshape(
+                    batch,
+                    length,
+                    attention.n_kv_heads,
+                    attention.head_dim,
+                )
+                if attention.v_proj is not None
+                else keys
+            )
+            keys = attention.k_norm(keys).transpose(0, 2, 1, 3)
+            keys = attention.rope(keys, offset=rope_offset)
+            values = attention.v_norm(values).transpose(0, 2, 1, 3)
+        entry.update_and_fetch(keys, values)
+        if attention.is_sliding:
+            entry.offset = prompt_length
+
+    return cache
 
 
 def _decode_diffusion_masked_draft(

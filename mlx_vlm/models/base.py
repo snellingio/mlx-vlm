@@ -15,6 +15,11 @@ from ..turboquant import _state_length as _turboquant_state_length
 from .cache import create_causal_mask
 
 
+def supports_fast_sdpa_window_size() -> bool:
+    signatures = getattr(mx.fast.scaled_dot_product_attention, "__nb_signature__", ())
+    return any("window_size" in signature[0] for signature in signatures)
+
+
 def load_chat_template(tokenizer, model_path):
     """Apply a chat template from the model directory to *tokenizer*."""
     import json
@@ -369,7 +374,13 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
+    window_size: Optional[int] = None,
 ) -> mx.array:
+    window_kwargs = (
+        {"window_size": window_size}
+        if window_size is not None and supports_fast_sdpa_window_size()
+        else {}
+    )
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
         # The fused kernels have no sink term, and the batch cache only shares
         # them when it holds a single unpadded row. Anything else dequantizes,
@@ -400,6 +411,7 @@ def scaled_dot_product_attention(
             scale=scale,
             mask=mask,
             sinks=sinks,
+            **window_kwargs,
         )
 
     if hasattr(cache, "bits"):
@@ -422,6 +434,7 @@ def scaled_dot_product_attention(
         scale=scale,
         mask=mask,
         sinks=sinks,
+        **window_kwargs,
     )
 
 
