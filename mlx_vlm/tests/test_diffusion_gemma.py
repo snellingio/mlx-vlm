@@ -2026,15 +2026,15 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
         nn.quantize(experts, group_size=64, bits=4, mode="affine")
         experts.eval()
 
-        x = mx.random.normal((32, 64)).astype(mx.bfloat16)
+        x = mx.random.normal((192, 64)).astype(mx.bfloat16)
         indices = mx.stack(
             (
-                mx.arange(32, dtype=mx.uint32) % 4,
-                (mx.arange(32, dtype=mx.uint32) + 1) % 4,
+                mx.arange(192, dtype=mx.uint32) % 4,
+                (mx.arange(192, dtype=mx.uint32) + 1) % 4,
             ),
             axis=-1,
         )
-        weights = mx.softmax(mx.random.normal((32, 2)), axis=-1)
+        weights = mx.softmax(mx.random.normal((192, 2)), axis=-1)
 
         sorted_x, sorted_indices, inverse = _gather_sort(
             mx.expand_dims(x, (-2, -3)),
@@ -2171,21 +2171,24 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
             np.array(larger_fused),
         )
 
-    def test_compiled_one_token_decoder_matches_eager_decoder(self):
-        from mlx_vlm.generate.diffusion import _make_structured_one_token_decoder
+    def test_compiled_structured_decoder_matches_eager_decoder(self):
+        from mlx_vlm.generate.diffusion import _make_structured_decoder
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
         mx.random.seed(0)
         model = Model(ModelConfig.from_dict(tiny_config_dict()))
-        compiled = _make_structured_one_token_decoder(model.model.decoder)
-        for length in (2, 10):
-            with self.subTest(length=length):
-                input_ids = mx.arange(length, dtype=mx.int32)[None]
+        compiled = _make_structured_decoder(model.model.decoder)
+        for prompt_length, canvas_length in ((2, 1), (10, 3), (6, 8)):
+            with self.subTest(
+                prompt_length=prompt_length,
+                canvas_length=canvas_length,
+            ):
+                input_ids = mx.arange(prompt_length, dtype=mx.int32)[None]
                 cache = model.diffusion_prefill_cache(
                     input_ids,
                     cache=model.make_cache(),
                 )
-                canvas = mx.array([[4]], dtype=mx.int32)
+                canvas = mx.arange(4, 4 + canvas_length, dtype=mx.int32)[None]
                 masks = model.diffusion_decoder_masks(canvas, cache, None)
                 eager = model.model.decoder(
                     canvas,
@@ -2204,6 +2207,51 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
                     np.array(candidate),
                     rtol=1e-5,
                     atol=2e-6,
+                )
+
+    def test_structured_candidate_batch_matches_single_reads(self):
+        from mlx_vlm.generate.diffusion import (
+            structured_diffusion_read,
+            structured_diffusion_read_batch,
+        )
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        input_ids = mx.array([[2, 3], [8, 9]], dtype=mx.int32)
+        canvases = [[4, 5, 6], [10, 11, 12]]
+        slots_batch = [
+            [(0, [7, 8]), (2, [9, 10, 11])],
+            [(1, [2, 3, 4]), (2, [5, 6])],
+        ]
+
+        batched = structured_diffusion_read_batch(
+            model,
+            input_ids,
+            canvases,
+            slots_batch,
+            candidate_only=True,
+        )
+        singles = [
+            structured_diffusion_read(
+                model,
+                input_ids[index],
+                canvases[index],
+                slots_batch[index],
+                candidate_only=True,
+            )
+            for index in range(2)
+        ]
+
+        for batch_reads, single_reads in zip(batched, singles):
+            self.assertEqual(
+                [read["token_id"] for read in batch_reads],
+                [read["token_id"] for read in single_reads],
+            )
+            for batch_read, single_read in zip(batch_reads, single_reads):
+                np.testing.assert_array_equal(
+                    batch_read["logprobs"],
+                    single_read["logprobs"],
                 )
 
     def test_structured_read_returns_exact_temperature_one_logprobs(self):

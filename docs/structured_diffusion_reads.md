@@ -65,3 +65,12 @@ The usage block confirms the scoring mode used by the server.
 Without `candidate_only`, `token_id`, `token_logprob`, and `entropy` cover the
 full vocabulary. `logprobs` holds the score for each requested token. With
 `candidate_only`, every returned value covers only the requested tokens.
+
+The server groups matching `candidate_only` requests for up to 2 ms. Each
+request keeps batch size one, so it uses the same 4-bit kernels and scores as a
+single request. MLX then evaluates the queued graphs together. A group holds at
+most four requests by default.
+
+Set `MLX_VLM_DIFFUSION_READ_BATCH_COALESCE_MS` to change the wait. Set
+`MLX_VLM_DIFFUSION_READ_MAX_BATCH_SIZE` to change the group limit. Use `0` for
+the wait to favor single-request latency.

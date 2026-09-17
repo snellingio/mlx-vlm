@@ -2564,6 +2564,64 @@ def test_diffusion_reads_endpoint_returns_exact_requested_tokens(client, monkeyp
     }
 
 
+def test_diffusion_worker_batches_equal_shape_reads(monkeypatch):
+    generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    generator.model = object()
+    first_queue = Queue()
+    second_queue = Queue()
+    requests = [
+        server_generation.QueuedDiffusionReadRequest(
+            rqueue=first_queue,
+            input_ids=[1, 2],
+            seed_canvas=[3, 4],
+            slots=[(0, [5, 6])],
+            candidate_only=True,
+        ),
+        server_generation.QueuedDiffusionReadRequest(
+            rqueue=second_queue,
+            input_ids=[7, 8],
+            seed_canvas=[9, 10],
+            slots=[(1, [11, 12, 13])],
+            candidate_only=True,
+        ),
+    ]
+    captured = {}
+
+    def fake_batch(model, input_ids, canvases, slots_batch, *, candidate_only):
+        captured.update(
+            model=model,
+            input_ids=np.array(input_ids),
+            canvases=canvases,
+            slots_batch=slots_batch,
+            candidate_only=candidate_only,
+        )
+        return [[{"position": 0}], [{"position": 1}]]
+
+    monkeypatch.setattr(
+        server_generation,
+        "structured_diffusion_read_batch",
+        fake_batch,
+    )
+
+    generator._run_diffusion_read_batch(requests)
+
+    np.testing.assert_array_equal(captured["input_ids"], [[1, 2], [7, 8]])
+    assert captured["model"] is generator.model
+    assert captured["canvases"] == [[3, 4], [9, 10]]
+    assert captured["slots_batch"] == [[(0, [5, 6])], [(1, [11, 12, 13])]]
+    assert captured["candidate_only"] is True
+    assert first_queue.get_nowait() == [{"position": 0}]
+    assert second_queue.get_nowait() == [{"position": 1}]
+
+
+def test_diffusion_read_batch_settings(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_DIFFUSION_READ_BATCH_COALESCE_MS", "3.5")
+    monkeypatch.setenv("MLX_VLM_DIFFUSION_READ_MAX_BATCH_SIZE", "4")
+
+    assert server_generation.get_diffusion_read_batch_coalesce_s() == 0.0035
+    assert server_generation.get_diffusion_read_max_batch_size() == 4
+
+
 def test_diffusion_read_rejects_native_context_overflow_before_queue(monkeypatch):
     generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
     generator.wait_until_ready = lambda: None
@@ -5437,6 +5495,26 @@ class TestResponseGenerator:
 
         assert pending == [first, second]
         assert should_stop is False
+
+    def test_collect_pending_requests_leaves_items_past_capacity_queued(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        first = object()
+        second = object()
+        third = object()
+        for item in (first, second, third):
+            gen.requests.put(item)
+
+        pending, should_stop = gen._collect_pending_requests(
+            active=False,
+            capacity=1,
+        )
+
+        assert pending == [first]
+        assert should_stop is False
+        assert gen.requests.get_nowait() is second
+        assert gen.requests.get_nowait() is third
 
     def test_step_streams_spm_subword_tokens_immediately(self):
         class SentencePieceTokenizer:

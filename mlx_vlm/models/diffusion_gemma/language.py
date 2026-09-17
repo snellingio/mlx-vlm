@@ -25,6 +25,8 @@ from ..switch_layers import (
 )
 from .config import ModelConfig, TextConfig
 
+FUSED_MOE_DOWN_MIN_ROUTES = 384
+
 
 @partial(mx.compile, shapeless=True)
 def geglu(gate, x):
@@ -160,6 +162,7 @@ class Experts(nn.Module):
         use_fused_down = (
             not self.training
             and do_sort
+            and top_k_indices.size >= FUSED_MOE_DOWN_MIN_ROUTES
             and _supports_quantized_moe_down()
             and getattr(down, "bits", None) == 4
             and getattr(down, "group_size", None) == 64
