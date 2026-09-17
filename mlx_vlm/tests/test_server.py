@@ -2695,6 +2695,68 @@ def test_diffusion_read_blocks_concurrent_model_switch(monkeypatch):
     assert other_load_started.is_set()
 
 
+def test_diffusion_read_keeps_http_event_loop_responsive(monkeypatch):
+    read_started = Event()
+    release_read = Event()
+
+    class BlockingGenerator:
+        model_path = "diffusion"
+
+        def diffusion_read(self, *args, **kwargs):
+            del args, kwargs
+            read_started.set()
+            assert release_read.wait(timeout=2)
+            return []
+
+    registry = MagicMock()
+    registry.for_kind.return_value = {
+        "model_path": "diffusion",
+        "response_generator": BlockingGenerator(),
+    }
+    monkeypatch.setattr(server._app_module, "_get_cached_model_unlocked", MagicMock())
+    monkeypatch.setattr(server._app_module, "_model_cache_registry", lambda: registry)
+    monkeypatch.setattr(
+        server._app_module,
+        "_server_runtime_snapshot",
+        lambda: {
+            "loaded_model": "diffusion",
+            "loaded_adapter": None,
+            "loaded_models": ["diffusion"],
+            "loaded_context_size": None,
+            "configured_context_limit": None,
+            "effective_context_limit": None,
+            "loaded_tool_parser": None,
+            "continuous_batching_enabled": True,
+            "apc": {"enabled": False},
+        },
+    )
+
+    read_thread = Thread(
+        target=server._app_module._run_cached_diffusion_read,
+        args=("diffusion", [2], [3], [(0, [4])]),
+    )
+    read_thread.start()
+    assert read_started.wait(timeout=2)
+
+    async def probe_http_loop():
+        with pytest.raises(server._app_module.HTTPException) as error:
+            server._app_module.get_cached_model("other", None)
+        health = await server._app_module.health_check(MagicMock())
+        return error.value.status_code, health
+
+    try:
+        status_code, health = asyncio.run(
+            asyncio.wait_for(probe_http_loop(), timeout=0.5)
+        )
+        assert status_code == 503
+        assert health["status"] == "healthy"
+    finally:
+        release_read.set()
+        read_thread.join(timeout=2)
+
+    assert not read_thread.is_alive()
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [

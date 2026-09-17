@@ -5,7 +5,7 @@ import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from threading import Lock, RLock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
@@ -557,6 +557,26 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
+@contextmanager
+def _model_cache_guard():
+    """Wait off-loop, but never block the HTTP event loop on the cache lock."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        acquired = _MODEL_CACHE_LOCK.acquire()
+    else:
+        acquired = _MODEL_CACHE_LOCK.acquire(blocking=False)
+        if not acquired:
+            raise HTTPException(
+                status_code=503,
+                detail="model cache is busy with another inference request",
+            )
+    try:
+        yield
+    finally:
+        _MODEL_CACHE_LOCK.release()
+
+
 def get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
@@ -564,7 +584,7 @@ def get_cached_model(
     model_kind: str = "auto",
 ):
     """Load or return one cache entry without concurrent cache switches."""
-    with _MODEL_CACHE_LOCK:
+    with _model_cache_guard():
         return _get_cached_model_unlocked(
             model_path,
             adapter_path,
@@ -947,7 +967,7 @@ def _get_cached_model_unlocked(
 # Synchronous unload function for internal use
 def unload_model_sync():
     """Unload model caches without racing an active cache-bound read."""
-    with _MODEL_CACHE_LOCK:
+    with _model_cache_guard():
         return _unload_model_sync_unlocked()
 
 
@@ -1030,7 +1050,7 @@ def _run_cached_diffusion_read(
     encoder_layers=None,
 ):
     """Load, bind, and keep the exact worker alive for one structured read."""
-    with _MODEL_CACHE_LOCK:
+    with _model_cache_guard():
         _get_cached_model_unlocked(model_path, None)
         cache = _model_cache_registry().for_kind("text_generation")
         generator = cache.get("response_generator")
@@ -1272,7 +1292,7 @@ async def unload_model_endpoint(request: Request):
         "models": snapshot["loaded_models"],
     }
 
-    if not unload_model_sync():  # Use the synchronous unload function
+    if not await asyncio.to_thread(unload_model_sync):
         return {"status": "no_model_loaded", "message": "No model is currently loaded"}
 
     return {
